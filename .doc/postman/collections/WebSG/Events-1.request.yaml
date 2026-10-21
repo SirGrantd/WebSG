@@ -1,0 +1,17 @@
+$kind: http-request
+name: Events
+description: ""
+url: http://localhost:{{port}}/v1/events?channel=default&limit=10
+method: GET
+headers:
+  X-Admin-Token: "{{websg_token_test}}"
+queryParams:
+  channel: default
+  limit: "10"
+settings:
+  disabledSystemHeaders:
+    - accept-encoding
+    - accept
+    - user-agent
+    - connection
+order: 1835

@@ -1,0 +1,6 @@
+name: WebSG
+values:
+  - key: port
+    value: ''
+  - key: websg_token_test
+    value: ''

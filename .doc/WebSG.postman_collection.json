@@ -1,0 +1,186 @@
+{
+	"info": {
+		"name": "WebSG Collection",
+		"description": "Coleção de testes completa para o WebSG (Webhook Stream Gateway)",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:5107"
+		},
+		{
+			"key": "admin_token",
+			"value": "websg_admin_dev"
+		},
+		{
+			"key": "channel_id",
+			"value": "default"
+		},
+		{
+			"key": "event_id",
+			"value": ""
+		}
+	],
+	"item": [
+		{
+			"name": "1. Health Check",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/health",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"health"
+					]
+				}
+			}
+		},
+		{
+			"name": "2. List Channels (Admin)",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "X-Admin-Token",
+						"value": "{{admin_token}}"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/v1/channels",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"v1",
+						"channels"
+					]
+				}
+			}
+		},
+		{
+			"name": "3. Ingest Webhook (POST)",
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"var eventId = pm.response.headers.get('X-Event-ID');",
+							"if (eventId) {",
+							"    pm.collectionVariables.set('event_id', eventId);",
+							"    console.log('Saved event_id:', eventId);",
+							"}"
+						],
+						"type": "text/javascript"
+					}
+				}
+			],
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"nfe\": \"000123987\",\n  \"cnpj\": \"12345678000199\",\n  \"status\": \"autorizada\",\n  \"valor\": 3450.90\n}"
+				},
+				"url": {
+					"raw": "{{base_url}}/v1/ingest/{{channel_id}}",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"v1",
+						"ingest",
+						"{{channel_id}}"
+					]
+				}
+			}
+		},
+		{
+			"name": "4. Stream SSE (Realtime)",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Accept",
+						"value": "text/event-stream"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/v1/stream?channel={{channel_id}}",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"v1",
+						"stream"
+					],
+					"query": [
+						{
+							"key": "channel",
+							"value": "{{channel_id}}"
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "5. List Events (Admin / Live Inspector)",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "X-Admin-Token",
+						"value": "{{admin_token}}"
+					}
+				],
+				"url": {
+					"raw": "{{base_url}}/v1/events?channel={{channel_id}}&limit=10",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"v1",
+						"events"
+					],
+					"query": [
+						{
+							"key": "channel",
+							"value": "{{channel_id}}"
+						},
+						{
+							"key": "limit",
+							"value": "10"
+						}
+					]
+				}
+			}
+		},
+		{
+			"name": "6. Ack Event",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"url": {
+					"raw": "{{base_url}}/v1/events/{{event_id}}/ack",
+					"host": [
+						"{{base_url}}"
+					],
+					"path": [
+						"v1",
+						"events",
+						"{{event_id}}",
+						"ack"
+					]
+				}
+			}
+		}
+	]
+}

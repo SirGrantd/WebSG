@@ -1,0 +1,17 @@
+id: default
+name: "Default Webhook Channel"
+
+http:
+  allowed_methods:
+    - POST
+  success_status: 200
+  success_body: '{"status":"ok"}'
+  max_body_size: "20MB"
+
+auth:
+  type: "none"
+  token: "${WEBSG_TOKEN}"
+
+middleware:
+  enabled: false
+  script: "modules/signed_payload.js"

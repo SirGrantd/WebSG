@@ -1,0 +1,18 @@
+# Compiled binaries
+bin/
+/websg
+*.exe
+
+# Embedded SQLite database files
+*.db
+*.db-wal
+*.db-shm
+
+# Local Docker development environment
+.docker-dev-*/
+
+# System caches and temporary files
+.DS_Store
+Thumbs.db
+
+.notes/

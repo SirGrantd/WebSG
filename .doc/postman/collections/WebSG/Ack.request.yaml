@@ -1,0 +1,11 @@
+$kind: http-request
+name: Ack Event
+description: "Confirma o processamento de um evento informando seu ID"
+url: http://localhost:{{port}}/v1/events/{{event_id}}/ack
+method: POST
+headers:
+  Content-Type: application/json
+settings:
+  disabledSystemHeaders:
+    - user-agent
+order: 5000
