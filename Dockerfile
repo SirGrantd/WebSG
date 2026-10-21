@@ -2,7 +2,7 @@
 # Objective: Minimal, secure multi-stage Dockerfile for packaging WebSG into a ~15MB production container on port 5107.
 
 # Stage 1: Build static Go binary
-FROM golang:1.24-alpine AS builder
+FROM golang:alpine AS builder
 
 WORKDIR /build
 
@@ -35,8 +35,7 @@ USER websg
 ENV PORT=5107 \
     DATABASE_PATH=/data/websg.db \
     CHANNELS_DIR=/channels \
-    MODULES_DIR=/modules \
-    WEBSG_ADMIN_TOKEN=websg_admin_dev
+    MODULES_DIR=/modules
 
 EXPOSE 5107
 

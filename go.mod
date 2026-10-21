@@ -1,6 +1,6 @@
 module github.com/grantd/websg
 
-go 1.27.2
+go 1.26.0
 
 require (
 	github.com/dop251/goja v0.0.0-20261021140635-64adc8bb4d51
