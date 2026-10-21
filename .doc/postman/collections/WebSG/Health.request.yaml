@@ -1,0 +1,12 @@
+$kind: http-request
+url: http://localhost:{{port}}/health
+method: GET
+headers:
+  Content-Type: application/json
+settings:
+  disabledSystemHeaders:
+    - user-agent
+    - accept
+    - accept-encoding
+    - connection
+order: 1000

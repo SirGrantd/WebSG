@@ -1,0 +1,14 @@
+$kind: http-request
+description: ""
+url: localhost:{{port}}/v1/channels
+method: GET
+headers:
+  Content-Type: application/json
+  X-Admin-Token: "{{websg_token_test}}"
+settings:
+  disabledSystemHeaders:
+    - user-agent
+    - accept
+    - accept-encoding
+    - connection
+order: 1821

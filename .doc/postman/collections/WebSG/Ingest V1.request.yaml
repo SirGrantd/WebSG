@@ -1,0 +1,16 @@
+$kind: http-request
+url: http://localhost:{{port}}/v1/ingest/default
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: json
+  content: '{"nfe":"123456","cnpj":"12345678000199","status":"autorizada","valor":1540.50}'
+settings:
+  disabledSystemHeaders:
+    - user-agent
+    - accept
+    - accept-encoding
+    - connection
+    - content-length
+order: 2000
