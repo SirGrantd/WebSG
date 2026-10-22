@@ -578,3 +578,78 @@ func TestStream_EnvelopeMode(t *testing.T) {
 		t.Errorf("expected envelope to contain original headers with X-Custom-Signature, got:\n%s", output)
 	}
 }
+
+func TestListChannels_SecretsNotExposed(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/channels", nil)
+	req.Header.Set("X-Admin-Token", "test_admin_token")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	// Ensure secret token for test_secure channel is NOT in the JSON response
+	if strings.Contains(body, "secret_token_abc") {
+		t.Errorf("security vulnerability: sensitive channel token leaked in /v1/channels response:\n%s", body)
+	}
+	// Ensure "token" field is omitted from auth
+	if strings.Contains(body, `"token":`) {
+		t.Errorf("expected token field to be omitted from JSON response, but found it in:\n%s", body)
+	}
+}
+
+func TestAck_AuthenticationAndValidation(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// 1. Ingest an event into protected channel test_secure (requires secret_token_abc)
+	ingestReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_secure?token=secret_token_abc", bytes.NewReader([]byte(`{"order":99}`)))
+	ingestRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ingestRec, ingestReq)
+	if ingestRec.Code != http.StatusAccepted {
+		t.Fatalf("ingest failed with status %d: %s", ingestRec.Code, ingestRec.Body.String())
+	}
+	evtID := ingestRec.Header().Get("X-Event-ID")
+	if evtID == "" {
+		t.Fatalf("expected X-Event-ID header to be present")
+	}
+
+	// 2. Ack without authentication -> 401 Unauthorized
+	unauthAck := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack", nil)
+	unauthRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(unauthRec, unauthAck)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for unauthenticated ack, got %d", unauthRec.Code)
+	}
+
+	// 3. Ack with wrong token -> 401 Unauthorized
+	wrongTokenAck := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack?token=wrong_secret", nil)
+	wrongTokenRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(wrongTokenRec, wrongTokenAck)
+	if wrongTokenRec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for wrong token ack, got %d", wrongTokenRec.Code)
+	}
+
+	// 4. Ack with correct channel token -> 200 OK
+	okTokenAck := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack", nil)
+	okTokenAck.Header.Set("Authorization", "Bearer secret_token_abc")
+	okTokenRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(okTokenRec, okTokenAck)
+	if okTokenRec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for valid bearer token ack, got %d. Body: %s", okTokenRec.Code, okTokenRec.Body.String())
+	}
+
+	// 5. Ack non-existent event with admin token -> 404 Not Found
+	notFoundAck := httptest.NewRequest(http.MethodPost, "/v1/events/nonexistent_ulid_12345/ack", nil)
+	notFoundAck.Header.Set("X-Admin-Token", "test_admin_token")
+	notFoundRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(notFoundRec, notFoundAck)
+	if notFoundRec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 Not Found for non-existent event ack, got %d", notFoundRec.Code)
+	}
+}

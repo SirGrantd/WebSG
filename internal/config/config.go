@@ -17,38 +17,38 @@ import (
 )
 
 type HTTPConfig struct {
-	AllowedMethods []string `yaml:"allowed_methods"`
-	SuccessStatus  int      `yaml:"success_status"`
-	SuccessBody    string   `yaml:"success_body"`
-	MaxBodySize    string   `yaml:"max_body_size"`
-	TimeoutMS      int      `yaml:"timeout_ms"`
+	AllowedMethods []string `yaml:"allowed_methods" json:"allowed_methods"`
+	SuccessStatus  int      `yaml:"success_status" json:"success_status"`
+	SuccessBody    string   `yaml:"success_body" json:"success_body"`
+	MaxBodySize    string   `yaml:"max_body_size" json:"max_body_size"`
+	TimeoutMS      int      `yaml:"timeout_ms" json:"timeout_ms"`
 }
 
 type AuthConfig struct {
-	Type  string `yaml:"type"`
-	Token string `yaml:"token"`
+	Type  string `yaml:"type" json:"type"`
+	Token string `yaml:"token" json:"-"`
 }
 
 type MiddlewareConfig struct {
-	Enabled bool              `yaml:"enabled"`
-	Script  string            `yaml:"script"`
-	Env     map[string]string `yaml:"env"`
+	Enabled bool              `yaml:"enabled" json:"enabled"`
+	Script  string            `yaml:"script" json:"script"`
+	Env     map[string]string `yaml:"env" json:"-"`
 }
 
 type CORSConfig struct {
-	AllowedOrigins []string `yaml:"allowed_origins"`
-	AllowedHeaders []string `yaml:"allowed_headers"`
-	AllowedMethods []string `yaml:"allowed_methods"`
+	AllowedOrigins []string `yaml:"allowed_origins" json:"allowed_origins"`
+	AllowedHeaders []string `yaml:"allowed_headers" json:"allowed_headers"`
+	AllowedMethods []string `yaml:"allowed_methods" json:"allowed_methods"`
 }
 
 type ChannelConfig struct {
-	ID               string           `yaml:"id"`
-	Name             string           `yaml:"name"`
-	HTTP             HTTPConfig       `yaml:"http"`
-	Auth             AuthConfig       `yaml:"auth"`
-	CORS             CORSConfig       `yaml:"cors"`
-	Middleware       MiddlewareConfig `yaml:"middleware"`
-	StreamMiddleware MiddlewareConfig `yaml:"stream_middleware"`
+	ID               string           `yaml:"id" json:"id"`
+	Name             string           `yaml:"name" json:"name"`
+	HTTP             HTTPConfig       `yaml:"http" json:"http"`
+	Auth             AuthConfig       `yaml:"auth" json:"auth"`
+	CORS             CORSConfig       `yaml:"cors" json:"cors"`
+	Middleware       MiddlewareConfig `yaml:"middleware" json:"middleware"`
+	StreamMiddleware MiddlewareConfig `yaml:"stream_middleware" json:"stream_middleware"`
 }
 
 func (c *ChannelConfig) MaxBodyBytes() int64 {
@@ -92,6 +92,7 @@ type Config struct {
 	ChannelsDir          string
 	ModulesDir           string
 	AdminToken           string
+	IsDefaultAdminToken  bool
 	HousekeepingInterval time.Duration
 	AckedRetention       time.Duration
 	UnackedRetention     time.Duration
@@ -119,9 +120,11 @@ func Load() *Config {
 		modulesDir = "modules"
 	}
 
+	isDefaultAdmin := false
 	adminToken := os.Getenv("WEBSG_ADMIN_TOKEN")
 	if adminToken == "" {
 		adminToken = "websg_admin_dev"
+		isDefaultAdmin = true
 	}
 
 	cfg := &Config{
@@ -130,6 +133,7 @@ func Load() *Config {
 		ChannelsDir:          channelsDir,
 		ModulesDir:           modulesDir,
 		AdminToken:           adminToken,
+		IsDefaultAdminToken:  isDefaultAdmin,
 		HousekeepingInterval: 1 * time.Hour,
 		AckedRetention:       24 * time.Hour,
 		UnackedRetention:     7 * 24 * time.Hour,
