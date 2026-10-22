@@ -417,7 +417,7 @@ function handle(req, env) {
 
 	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
 
-	// 1. Test CORS preflight (OPTIONS)
+	// 1. Test CORS preflight (OPTIONS) with allowed origin
 	optReq := httptest.NewRequest(http.MethodOptions, "/v1/stream?channel=chan_stream_mw", nil)
 	optReq.Header.Set("Origin", "https://erp.app.com")
 	optRec := httptest.NewRecorder()
@@ -428,6 +428,19 @@ function handle(req, env) {
 	}
 	if optRec.Header().Get("Access-Control-Allow-Origin") != "https://erp.app.com" {
 		t.Errorf("expected CORS origin https://erp.app.com, got %s", optRec.Header().Get("Access-Control-Allow-Origin"))
+	}
+	if optRec.Header().Get("Vary") != "Origin" {
+		t.Errorf("expected Vary: Origin header, got %s", optRec.Header().Get("Vary"))
+	}
+
+	// 1b. Test CORS preflight (OPTIONS) with unauthorized origin (should NOT emit CORS header)
+	unauthOptReq := httptest.NewRequest(http.MethodOptions, "/v1/stream?channel=chan_stream_mw", nil)
+	unauthOptReq.Header.Set("Origin", "https://evil.com")
+	unauthOptRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(unauthOptRec, unauthOptReq)
+
+	if unauthOptRec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("expected empty Access-Control-Allow-Origin for unauthorized origin, got %s", unauthOptRec.Header().Get("Access-Control-Allow-Origin"))
 	}
 
 	// 2. Test Stream Middleware Reject (Invalid Token)

@@ -178,7 +178,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
-			w.Write([]byte(fmt.Sprintf(`{"error":%q}`, errMsg)))
+			w.Write(fmt.Appendf(nil, `{"error":%q}`, errMsg))
 			return
 		}
 	}
@@ -250,7 +250,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(fmt.Sprintf(`{"error":"stream middleware error: %s"}`, err.Error())))
+			w.Write(fmt.Appendf(nil, `{"error":"stream middleware error: %s"}`, err.Error()))
 			return
 		}
 
@@ -265,7 +265,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
-			w.Write([]byte(fmt.Sprintf(`{"error":%q}`, errMsg)))
+			w.Write(fmt.Appendf(nil, `{"error":%q}`, errMsg))
 			return
 		}
 	} else if !s.validateAuth(r, ch) {
@@ -342,7 +342,7 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf(`{"status":"acked","id":%q}`, id)))
+	fmt.Fprintf(w, `{"status":"acked","id":%q}`, id)
 }
 
 func isMethodAllowed(method string, allowed []string) bool {
@@ -421,7 +421,7 @@ func (s *Server) handleStreamOptions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request, ch *config.ChannelConfig) {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		origin = "*"
+		return
 	}
 
 	allowedOrigins := []string{"*"}
@@ -429,16 +429,37 @@ func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request, ch *config.Ch
 		allowedOrigins = ch.CORS.AllowedOrigins
 	}
 
-	allowOrigin := "*"
+	var allowOrigin string
 	for _, o := range allowedOrigins {
-		if o == "*" || o == origin {
-			allowOrigin = o
+		if o == "*" {
+			allowOrigin = "*"
+			break
+		}
+		if o == origin {
+			allowOrigin = origin
 			break
 		}
 	}
 
+	if allowOrigin == "" {
+		return
+	}
+
 	w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Last-Event-ID, Authorization, Content-Type, X-Token, X-Admin-Token")
+	if allowOrigin != "*" {
+		w.Header().Set("Vary", "Origin")
+	}
+
+	allowedMethods := "GET, POST, OPTIONS"
+	if ch != nil && len(ch.CORS.AllowedMethods) > 0 {
+		allowedMethods = strings.Join(ch.CORS.AllowedMethods, ", ")
+	}
+	w.Header().Set("Access-Control-Allow-Methods", allowedMethods)
+
+	allowedHeaders := "Last-Event-ID, Authorization, Content-Type, X-Token, X-Admin-Token"
+	if ch != nil && len(ch.CORS.AllowedHeaders) > 0 {
+		allowedHeaders = strings.Join(ch.CORS.AllowedHeaders, ", ")
+	}
+	w.Header().Set("Access-Control-Allow-Headers", allowedHeaders)
 	w.Header().Set("Access-Control-Expose-Headers", "X-Event-ID")
 }
