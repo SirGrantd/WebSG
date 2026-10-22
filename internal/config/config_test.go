@@ -103,3 +103,44 @@ http:
 		t.Errorf("expected broken channel to not be registered")
 	}
 }
+
+func TestAuthConfig_TokenSegregation(t *testing.T) {
+	// Case 1: Legacy token only
+	legacy := AuthConfig{
+		Type:  "token",
+		Token: "shared_secret",
+	}
+	if legacy.GetIngestToken() != "shared_secret" {
+		t.Errorf("expected GetIngestToken() = 'shared_secret', got %q", legacy.GetIngestToken())
+	}
+	if legacy.GetStreamToken() != "shared_secret" {
+		t.Errorf("expected GetStreamToken() = 'shared_secret', got %q", legacy.GetStreamToken())
+	}
+
+	// Case 2: Segregated tokens
+	segregated := AuthConfig{
+		Type:        "token",
+		Token:       "legacy_secret",
+		IngestToken: "ingest_secret",
+		StreamToken: "stream_secret",
+	}
+	if segregated.GetIngestToken() != "ingest_secret" {
+		t.Errorf("expected GetIngestToken() = 'ingest_secret', got %q", segregated.GetIngestToken())
+	}
+	if segregated.GetStreamToken() != "stream_secret" {
+		t.Errorf("expected GetStreamToken() = 'stream_secret', got %q", segregated.GetStreamToken())
+	}
+
+	// Case 3: ClientToken alias for StreamToken
+	alias := AuthConfig{
+		Type:        "token",
+		IngestToken: "ingest_secret",
+		ClientToken: "client_secret",
+	}
+	if alias.GetIngestToken() != "ingest_secret" {
+		t.Errorf("expected GetIngestToken() = 'ingest_secret', got %q", alias.GetIngestToken())
+	}
+	if alias.GetStreamToken() != "client_secret" {
+		t.Errorf("expected GetStreamToken() = 'client_secret', got %q", alias.GetStreamToken())
+	}
+}

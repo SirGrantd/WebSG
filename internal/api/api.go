@@ -126,7 +126,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.validateAuth(r, ch) {
+	if !s.validateIngestAuth(r, ch) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
@@ -294,7 +294,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, status, errMsg)
 			return
 		}
-	} else if !s.validateAuth(r, ch) {
+	} else if !s.validateStreamAuth(r, ch) {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -385,7 +385,6 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	if channelID == "" {
 		channelID = r.Header.Get("X-Channel")
 	}
-
 	if channelID == "" {
 		discoveredChan, err := s.storage.GetEventChannel(r.Context(), id)
 		if err != nil {
@@ -406,7 +405,7 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	authorized := s.validateAdminAuth(r)
 	if !authorized {
 		ch, exists := s.cfg.GetChannel(channelID)
-		if exists && s.validateAuth(r, ch) {
+		if exists && s.validateStreamAuth(r, ch) {
 			authorized = true
 		}
 	}
@@ -457,30 +456,51 @@ func secureCompare(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-func (s *Server) validateAuth(r *http.Request, ch *config.ChannelConfig) bool {
-	if ch.Auth.Type == "none" || ch.Auth.Token == "" {
+func (s *Server) validateAuthToken(r *http.Request, expectedToken string) bool {
+	if expectedToken == "" {
 		return true
 	}
 
 	queryToken := r.URL.Query().Get("token")
-	if queryToken != "" && secureCompare(queryToken, ch.Auth.Token) {
+	if queryToken != "" && secureCompare(queryToken, expectedToken) {
 		return true
 	}
 
 	headerToken := r.Header.Get("X-Token")
-	if headerToken != "" && secureCompare(headerToken, ch.Auth.Token) {
+	if headerToken != "" && secureCompare(headerToken, expectedToken) {
 		return true
 	}
 
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if secureCompare(token, ch.Auth.Token) {
+		if secureCompare(token, expectedToken) {
 			return true
 		}
 	}
 
 	return false
+}
+
+func (s *Server) validateIngestAuth(r *http.Request, ch *config.ChannelConfig) bool {
+	if ch.Auth.Type == "none" {
+		return true
+	}
+	return s.validateAuthToken(r, ch.Auth.GetIngestToken())
+}
+
+func (s *Server) validateStreamAuth(r *http.Request, ch *config.ChannelConfig) bool {
+	if ch.Auth.Type == "none" {
+		return true
+	}
+	return s.validateAuthToken(r, ch.Auth.GetStreamToken())
+}
+
+func (s *Server) validateAuth(r *http.Request, ch *config.ChannelConfig) bool {
+	if ch.Auth.Type == "none" {
+		return true
+	}
+	return s.validateAuthToken(r, ch.Auth.Token)
 }
 
 func (s *Server) validateAdminAuth(r *http.Request) bool {
