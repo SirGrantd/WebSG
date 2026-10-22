@@ -461,3 +461,84 @@ function handle(req, env) {
 		t.Errorf("expected Content-Type text/event-stream, got %q", contentType)
 	}
 }
+
+func TestIngestAndStream_CredentialSegregation(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	srv.cfg.Channels["test_segregated"] = &config.ChannelConfig{
+		ID:   "test_segregated",
+		Name: "Segregated Auth Channel",
+		HTTP: config.HTTPConfig{
+			AllowedMethods: []string{"POST"},
+			SuccessStatus:  http.StatusOK,
+			MaxBodySize:    "1MB",
+		},
+		Auth: config.AuthConfig{
+			Type:        "token",
+			IngestToken: "webhook_ingest_token_only",
+			StreamToken: "erp_client_stream_token_only",
+		},
+	}
+
+	// 1. Ingest with IngestToken -> Success (200 OK)
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_segregated", bytes.NewReader([]byte(`{"data":"valid"}`)))
+	req1.Header.Set("Authorization", "Bearer webhook_ingest_token_only")
+	rec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected Ingest with IngestToken to succeed (200), got %d", rec1.Code)
+	}
+
+	// 2. Ingest with StreamToken -> Rejected (401 Unauthorized)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_segregated", bytes.NewReader([]byte(`{"data":"valid"}`)))
+	req2.Header.Set("Authorization", "Bearer erp_client_stream_token_only")
+	rec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("expected Ingest with StreamToken to be 401 Unauthorized, got %d", rec2.Code)
+	}
+
+	// 3. Stream with StreamToken -> Connects (200 OK text/event-stream)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req3 := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_segregated", nil).WithContext(ctx)
+	req3.Header.Set("Authorization", "Bearer erp_client_stream_token_only")
+	rec3 := httptest.NewRecorder()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	srv.Routes().ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("expected Stream with StreamToken to succeed (200), got %d", rec3.Code)
+	}
+
+	// 4. Stream with IngestToken -> Rejected (401 Unauthorized)
+	req4 := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_segregated", nil)
+	req4.Header.Set("Authorization", "Bearer webhook_ingest_token_only")
+	rec4 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec4, req4)
+	if rec4.Code != http.StatusUnauthorized {
+		t.Fatalf("expected Stream with IngestToken to be 401 Unauthorized, got %d", rec4.Code)
+	}
+
+	// 5. Ack with StreamToken -> Success (200 OK)
+	req5 := httptest.NewRequest(http.MethodPost, "/v1/events/evt_mock/ack?channel=test_segregated", nil)
+	req5.Header.Set("Authorization", "Bearer erp_client_stream_token_only")
+	rec5 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec5, req5)
+	if rec5.Code != http.StatusOK {
+		t.Fatalf("expected Ack with StreamToken to succeed (200), got %d", rec5.Code)
+	}
+
+	// 6. Ack with IngestToken -> Rejected (401 Unauthorized)
+	req6 := httptest.NewRequest(http.MethodPost, "/v1/events/evt_mock/ack?channel=test_segregated", nil)
+	req6.Header.Set("Authorization", "Bearer webhook_ingest_token_only")
+	rec6 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec6, req6)
+	if rec6.Code != http.StatusUnauthorized {
+		t.Fatalf("expected Ack with IngestToken to be 401 Unauthorized, got %d", rec6.Code)
+	}
+}

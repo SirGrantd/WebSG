@@ -4,6 +4,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -115,7 +116,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.validateAuth(r, ch) {
+	if !s.validateIngestAuth(r, ch) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
@@ -268,7 +269,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(fmt.Sprintf(`{"error":%q}`, errMsg)))
 			return
 		}
-	} else if !s.validateAuth(r, ch) {
+	} else if !s.validateStreamAuth(r, ch) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
@@ -335,6 +336,19 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	channelID := r.URL.Query().Get("channel")
+	if channelID == "" {
+		channelID = r.Header.Get("X-Channel")
+	}
+	if channelID != "" {
+		if ch, ok := s.cfg.GetChannel(channelID); ok {
+			if !s.validateStreamAuth(r, ch) {
+				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+	}
+
 	if err := s.storage.AckEvent(r.Context(), id); err != nil {
 		http.Error(w, `{"error":"failed to ack event"}`, http.StatusInternalServerError)
 		return
@@ -357,30 +371,51 @@ func isMethodAllowed(method string, allowed []string) bool {
 	return false
 }
 
-func (s *Server) validateAuth(r *http.Request, ch *config.ChannelConfig) bool {
-	if ch.Auth.Type == "none" || ch.Auth.Token == "" {
+func (s *Server) validateAuthToken(r *http.Request, expectedToken string) bool {
+	if expectedToken == "" {
 		return true
 	}
 
 	queryToken := r.URL.Query().Get("token")
-	if queryToken != "" && queryToken == ch.Auth.Token {
+	if queryToken != "" && subtle.ConstantTimeCompare([]byte(queryToken), []byte(expectedToken)) == 1 {
 		return true
 	}
 
 	headerToken := r.Header.Get("X-Token")
-	if headerToken != "" && headerToken == ch.Auth.Token {
+	if headerToken != "" && subtle.ConstantTimeCompare([]byte(headerToken), []byte(expectedToken)) == 1 {
 		return true
 	}
 
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if token == ch.Auth.Token {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(expectedToken)) == 1 {
 			return true
 		}
 	}
 
 	return false
+}
+
+func (s *Server) validateIngestAuth(r *http.Request, ch *config.ChannelConfig) bool {
+	if ch.Auth.Type == "none" {
+		return true
+	}
+	return s.validateAuthToken(r, ch.Auth.GetIngestToken())
+}
+
+func (s *Server) validateStreamAuth(r *http.Request, ch *config.ChannelConfig) bool {
+	if ch.Auth.Type == "none" {
+		return true
+	}
+	return s.validateAuthToken(r, ch.Auth.GetStreamToken())
+}
+
+func (s *Server) validateAuth(r *http.Request, ch *config.ChannelConfig) bool {
+	if ch.Auth.Type == "none" {
+		return true
+	}
+	return s.validateAuthToken(r, ch.Auth.Token)
 }
 
 func (s *Server) validateAdminAuth(r *http.Request) bool {
@@ -389,19 +424,21 @@ func (s *Server) validateAdminAuth(r *http.Request) bool {
 		return true
 	}
 
-	if r.Header.Get("X-Admin-Token") == adminToken {
+	headerToken := r.Header.Get("X-Admin-Token")
+	if headerToken != "" && subtle.ConstantTimeCompare([]byte(headerToken), []byte(adminToken)) == 1 {
 		return true
 	}
 
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if token == adminToken {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) == 1 {
 			return true
 		}
 	}
 
-	if r.URL.Query().Get("admin_token") == adminToken {
+	queryToken := r.URL.Query().Get("admin_token")
+	if queryToken != "" && subtle.ConstantTimeCompare([]byte(queryToken), []byte(adminToken)) == 1 {
 		return true
 	}
 

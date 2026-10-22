@@ -25,8 +25,28 @@ type HTTPConfig struct {
 }
 
 type AuthConfig struct {
-	Type  string `yaml:"type"`
-	Token string `yaml:"token"`
+	Type        string `yaml:"type"`
+	Token       string `yaml:"token" json:"-"`
+	IngestToken string `yaml:"ingest_token" json:"-"`
+	StreamToken string `yaml:"stream_token" json:"-"`
+	ClientToken string `yaml:"client_token" json:"-"`
+}
+
+func (a AuthConfig) GetIngestToken() string {
+	if a.IngestToken != "" {
+		return a.IngestToken
+	}
+	return a.Token
+}
+
+func (a AuthConfig) GetStreamToken() string {
+	if a.StreamToken != "" {
+		return a.StreamToken
+	}
+	if a.ClientToken != "" {
+		return a.ClientToken
+	}
+	return a.Token
 }
 
 type MiddlewareConfig struct {
