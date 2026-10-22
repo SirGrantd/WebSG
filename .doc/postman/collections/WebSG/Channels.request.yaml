@@ -1,6 +1,6 @@
 $kind: http-request
 description: ""
-url: localhost:{{port}}/v1/channels
+url: http://localhost:{{port}}/v1/channels
 method: GET
 headers:
   Content-Type: application/json
