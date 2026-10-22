@@ -461,3 +461,107 @@ function handle(req, env) {
 		t.Errorf("expected Content-Type text/event-stream, got %q", contentType)
 	}
 }
+
+func TestIngest_EventTypeValidation(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// 1. Valid event_type with alphanumeric, dots, hyphens, and underscores -> 200
+	validReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=order.created_v1-final", bytes.NewReader([]byte(`{}`)))
+	validRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(validRec, validReq)
+	if validRec.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid event_type, got %d", validRec.Code)
+	}
+
+	// 2. Malicious event_type with newline / injection characters -> 400
+	badReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=webhook%0Aid:%20fake", bytes.NewReader([]byte(`{}`)))
+	badRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for event_type with newline injection, got %d", badRec.Code)
+	}
+
+	// 3. Malicious event_type with spaces -> 400
+	spaceReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=invalid%20type", bytes.NewReader([]byte(`{}`)))
+	spaceRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(spaceRec, spaceReq)
+	if spaceRec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for event_type with spaces, got %d", spaceRec.Code)
+	}
+}
+
+func TestStream_MultilinePayload(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	multilinePayload := "{\n  \"line1\": 1,\n  \"line2\": 2\n}"
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open", bytes.NewReader([]byte(multilinePayload))))
+	evtID := rec.Header().Get("X-Event-ID")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_open", nil).WithContext(ctx)
+	streamReq.Header.Set("Last-Event-ID", "00000000000000000000000000") // forces replay from beginning
+	streamRec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(streamRec, streamReq)
+	output := streamRec.Body.String()
+
+	if !strings.Contains(output, "id: "+evtID) {
+		t.Fatalf("expected stream to contain event id %s, got:\n%s", evtID, output)
+	}
+
+	// Ensure each line of the multiline payload is properly prefixed with "data: "
+	expectedLines := []string{
+		"data: {",
+		"data:   \"line1\": 1,",
+		"data:   \"line2\": 2",
+		"data: }",
+	}
+	for _, expected := range expectedLines {
+		if !strings.Contains(output, expected) {
+			t.Errorf("expected stream to contain %q, but got:\n%s", expected, output)
+		}
+	}
+}
+
+func TestStream_EnvelopeMode(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Ingest with custom header
+	ingestReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=invoice.created", bytes.NewReader([]byte(`{"total":250.5}`)))
+	ingestReq.Header.Set("X-Custom-Signature", "sig_xyz_123")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, ingestReq)
+	evtID := rec.Header().Get("X-Event-ID")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// Request with envelope format
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_open&format=envelope", nil).WithContext(ctx)
+	streamReq.Header.Set("Last-Event-ID", "00000000000000000000000000")
+	streamRec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(streamRec, streamReq)
+	output := streamRec.Body.String()
+
+	if !strings.Contains(output, "id: "+evtID) {
+		t.Fatalf("expected stream to contain event id %s, got:\n%s", evtID, output)
+	}
+
+	// Verify envelope contains metadata
+	if !strings.Contains(output, `"event_type":"invoice.created"`) {
+		t.Errorf("expected envelope to contain event_type 'invoice.created', got:\n%s", output)
+	}
+	if !strings.Contains(output, `"created_at":`) {
+		t.Errorf("expected envelope to contain created_at timestamp, got:\n%s", output)
+	}
+	if !strings.Contains(output, "X-Custom-Signature") || !strings.Contains(output, "sig_xyz_123") {
+		t.Errorf("expected envelope to contain original headers with X-Custom-Signature, got:\n%s", output)
+	}
+}
