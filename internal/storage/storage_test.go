@@ -6,6 +6,7 @@ package storage
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -59,7 +60,7 @@ func TestStorage_SyncChannels(t *testing.T) {
 	}
 
 	// Verify they exist in the SQLite channels table
-	rows, err := s.db.Query("SELECT id, name FROM channels ORDER BY id ASC")
+	rows, err := s.readDB.Query("SELECT id, name FROM channels ORDER BY id ASC")
 	if err != nil {
 		t.Fatalf("failed to query channels: %v", err)
 	}
@@ -152,7 +153,7 @@ func TestStorage_GetEventsAfter_And_Ack(t *testing.T) {
 
 	// Verify status in DB
 	var status string
-	err = s.db.QueryRow("SELECT status FROM events WHERE id = ?", evt2.ID).Scan(&status)
+	err = s.readDB.QueryRow("SELECT status FROM events WHERE id = ?", evt2.ID).Scan(&status)
 	if err != nil {
 		t.Fatalf("failed to query status: %v", err)
 	}
@@ -196,13 +197,13 @@ func TestStorage_PruneEvents(t *testing.T) {
 	_ = s.AckEvent(ctx, evtOldAcked.ID)
 
 	oldAckedDate := time.Now().Add(-48 * time.Hour).UTC().Format("2006-01-02 15:04:05")
-	_, err = s.db.Exec("UPDATE events SET created_at = ?, acked_at = ? WHERE id = ?", oldAckedDate, oldAckedDate, evtOldAcked.ID)
+	_, err = s.writeDB.Exec("UPDATE events SET created_at = ?, acked_at = ? WHERE id = ?", oldAckedDate, oldAckedDate, evtOldAcked.ID)
 	if err != nil {
 		t.Fatalf("failed to backdate old acked event: %v", err)
 	}
 
 	oldUnackedDate := time.Now().Add(-10 * 24 * time.Hour).UTC().Format("2006-01-02 15:04:05")
-	_, err = s.db.Exec("UPDATE events SET created_at = ? WHERE id = ?", oldUnackedDate, evtOldUnacked.ID)
+	_, err = s.writeDB.Exec("UPDATE events SET created_at = ? WHERE id = ?", oldUnackedDate, evtOldUnacked.ID)
 	if err != nil {
 		t.Fatalf("failed to backdate old unacked event: %v", err)
 	}
@@ -230,4 +231,107 @@ func TestStorage_PruneEvents(t *testing.T) {
 	if !remainingIDs[evtRecentPending.ID] || !remainingIDs[evtRecentAcked.ID] {
 		t.Errorf("expected recent events to remain in storage")
 	}
+}
+
+func TestStorage_GroupCommitBatching(t *testing.T) {
+	dbPath := "test_batching.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-wal")
+	defer os.Remove(dbPath + "-shm")
+
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to initialize storage: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	totalEvents := 120
+	var wg sync.WaitGroup
+
+	errCh := make(chan error, totalEvents)
+	for i := 0; i < totalEvents; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, err := s.InsertEvent(ctx, "chan_batch", "webhook", `{"batch":"true"}`, []byte(`{"idx":1}`))
+			if err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("unexpected insert error in batching: %v", err)
+	}
+
+	var count int
+	if err := s.readDB.QueryRow("SELECT COUNT(*) FROM events WHERE channel_id = 'chan_batch'").Scan(&count); err != nil {
+		t.Fatalf("failed to count events: %v", err)
+	}
+
+	if count != totalEvents {
+		t.Fatalf("expected %d events, got %d", totalEvents, count)
+	}
+}
+
+func TestStorage_ConcurrentReadWrite(t *testing.T) {
+	dbPath := "test_concurrent_rw.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-wal")
+	defer os.Remove(dbPath + "-shm")
+
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to initialize storage: %v", err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	// Concurrently insert events
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					_, _ = s.InsertEvent(ctx, "chan_rw", "webhook", `{}`, []byte(`{"hello":"world"}`))
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+		}()
+	}
+
+	// Concurrently read events using read pool
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					_, err := s.ListEvents(ctx, "chan_rw", 20)
+					if err != nil && ctx.Err() == nil {
+						t.Errorf("read error: %v", err)
+						return
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }
