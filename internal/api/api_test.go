@@ -6,6 +6,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -459,5 +460,120 @@ function handle(req, env) {
 
 	if contentType := okRec.Header().Get("Content-Type"); contentType != "text/event-stream" {
 		t.Errorf("expected Content-Type text/event-stream, got %q", contentType)
+	}
+}
+
+func TestMiddleware_HeaderCasingConsistency(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Middleware checking lowercase authorization header
+	scriptContent := `
+function handle(req, env) {
+    if (req.headers["authorization"] === "Bearer valid_ingest_token") {
+        return { accept: true };
+    }
+    return { accept: false, status: 401, error: "Missing or invalid authorization" };
+}
+`
+	scriptPath := filepath.Join(tmpDir, "check_auth.js")
+	_ = os.WriteFile(scriptPath, []byte(scriptContent), 0644)
+
+	dbPath := filepath.Join(tmpDir, "test_mw_casing.db")
+	store, _ := storage.New(dbPath)
+	defer store.Close()
+
+	cfg := &config.Config{
+		Port:        "8080",
+		ChannelsDir: "channels",
+		AdminToken:  "admin",
+		Channels: map[string]*config.ChannelConfig{
+			"chan_casing": {
+				ID:   "chan_casing",
+				Name: "Casing Channel",
+				HTTP: config.HTTPConfig{
+					AllowedMethods: []string{"POST"},
+					SuccessStatus:  200,
+				},
+				Auth: config.AuthConfig{Type: "none"},
+				Middleware: config.MiddlewareConfig{
+					Enabled: true,
+					Script:  scriptPath,
+				},
+			},
+		},
+	}
+
+	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
+
+	// Send request with standard canonical title-cased "Authorization" header
+	req := httptest.NewRequest(http.MethodPost, "/v1/ingest/chan_casing", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer valid_ingest_token")
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK with lowercase header lookup in middleware, got %d. Body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMiddleware_CorruptedJSONErrorEscaping(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Middleware returning error message with double quotes, special characters, and newlines
+	scriptContent := `
+function handle(req, env) {
+    return {
+        accept: false,
+        status: 422,
+        error: 'SyntaxError: Unexpected token "}" in {\n  "test": 123\n}'
+    };
+}
+`
+	scriptPath := filepath.Join(tmpDir, "quote_error.js")
+	_ = os.WriteFile(scriptPath, []byte(scriptContent), 0644)
+
+	dbPath := filepath.Join(tmpDir, "test_mw_err.db")
+	store, _ := storage.New(dbPath)
+	defer store.Close()
+
+	cfg := &config.Config{
+		Port:        "8080",
+		ChannelsDir: "channels",
+		AdminToken:  "admin",
+		Channels: map[string]*config.ChannelConfig{
+			"chan_err": {
+				ID:   "chan_err",
+				Name: "Error Channel",
+				HTTP: config.HTTPConfig{
+					AllowedMethods: []string{"POST"},
+					SuccessStatus:  200,
+				},
+				Auth: config.AuthConfig{Type: "none"},
+				Middleware: config.MiddlewareConfig{
+					Enabled: true,
+					Script:  scriptPath,
+				},
+			},
+		},
+	}
+
+	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/ingest/chan_err", bytes.NewReader([]byte(`{}`)))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != 422 {
+		t.Fatalf("expected 422, got %d", rec.Code)
+	}
+
+	// Verify the body is 100% valid JSON despite quotes and newlines in the JS error message
+	var parsed map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("response body is not valid JSON (corrupted by quotes/newlines): %v. Body was:\n%s", err, rec.Body.String())
+	}
+
+	if !strings.Contains(parsed["error"], "SyntaxError: Unexpected token") {
+		t.Errorf("expected error message to be preserved in parsed JSON, got: %s", parsed["error"])
 	}
 }
