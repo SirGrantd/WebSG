@@ -74,3 +74,32 @@ auth:
 		t.Errorf("expected 15MB in bytes, got %d", ch.MaxBodyBytes())
 	}
 }
+
+func TestConfig_ReloadChannels_InvalidYAML(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	invalidYAML := `
+id: broken_chan
+name: "Broken Channel
+http:
+  allowed_methods: [
+`
+	err := os.WriteFile(filepath.Join(tmpDir, "broken.yaml"), []byte(invalidYAML), 0644)
+	if err != nil {
+		t.Fatalf("failed to write invalid channel file: %v", err)
+	}
+
+	cfg := &Config{
+		ChannelsDir: tmpDir,
+		Channels:    make(map[string]*ChannelConfig),
+	}
+
+	// Should not fail or crash, but skip the broken file and log a warning
+	if err := cfg.ReloadChannels(); err != nil {
+		t.Fatalf("ReloadChannels returned unexpected error: %v", err)
+	}
+
+	if _, exists := cfg.GetChannel("broken_chan"); exists {
+		t.Errorf("expected broken channel to not be registered")
+	}
+}

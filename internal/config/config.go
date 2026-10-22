@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +16,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+var sizeRegex = regexp.MustCompile(`^(\d+)\s*(B|KB|MB|GB)?$`)
 
 type HTTPConfig struct {
 	AllowedMethods []string `yaml:"allowed_methods" json:"allowed_methods"`
@@ -49,16 +52,23 @@ type ChannelConfig struct {
 	CORS             CORSConfig       `yaml:"cors" json:"cors"`
 	Middleware       MiddlewareConfig `yaml:"middleware" json:"middleware"`
 	StreamMiddleware MiddlewareConfig `yaml:"stream_middleware" json:"stream_middleware"`
+	maxBodyBytes     int64
 }
 
 func (c *ChannelConfig) MaxBodyBytes() int64 {
-	str := strings.TrimSpace(strings.ToUpper(c.HTTP.MaxBodySize))
+	if c.maxBodyBytes > 0 {
+		return c.maxBodyBytes
+	}
+	return parseMaxBodyBytes(c.HTTP.MaxBodySize)
+}
+
+func parseMaxBodyBytes(sizeStr string) int64 {
+	str := strings.TrimSpace(strings.ToUpper(sizeStr))
 	if str == "" {
 		return 20 << 20
 	}
 
-	re := regexp.MustCompile(`^(\d+)\s*(B|KB|MB|GB)?$`)
-	matches := re.FindStringSubmatch(str)
+	matches := sizeRegex.FindStringSubmatch(str)
 	if len(matches) < 2 {
 		return 20 << 20
 	}
@@ -163,6 +173,7 @@ func (c *Config) ReloadChannels() error {
 	for _, file := range files {
 		data, err := os.ReadFile(file)
 		if err != nil {
+			log.Printf("[WebSG Config] Warning: failed to read channel file %s: %v", file, err)
 			continue
 		}
 
@@ -170,8 +181,11 @@ func (c *Config) ReloadChannels() error {
 
 		var ch ChannelConfig
 		if err := yaml.Unmarshal([]byte(expandedData), &ch); err != nil {
+			log.Printf("[WebSG Config] Warning: failed to parse YAML channel file %s: %v", file, err)
 			continue
 		}
+
+		ch.maxBodyBytes = parseMaxBodyBytes(ch.HTTP.MaxBodySize)
 
 		if ch.ID == "" {
 			base := filepath.Base(file)
