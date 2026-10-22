@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -691,5 +692,67 @@ func TestAck_AuthenticationAndValidation(t *testing.T) {
 	srv.Routes().ServeHTTP(notFoundRec, notFoundAck)
 	if notFoundRec.Code != http.StatusNotFound {
 		t.Errorf("expected 404 Not Found for non-existent event ack, got %d", notFoundRec.Code)
+	}
+}
+
+func TestServer_GracefulShutdownWithActiveSSE(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	httpServer := &http.Server{
+		Handler: srv.Routes(),
+		BaseContext: func(l net.Listener) context.Context {
+			return rootCtx
+		},
+	}
+
+	go func() {
+		_ = httpServer.Serve(listener)
+	}()
+
+	addr := listener.Addr().String()
+
+	resp, err := http.Get("http://" + addr + "/v1/stream?channel=test_open")
+	if err != nil {
+		t.Fatalf("failed to connect to stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from stream, got %d", resp.StatusCode)
+	}
+
+	buf := make([]byte, 64)
+	n, _ := resp.Body.Read(buf)
+	if !strings.Contains(string(buf[:n]), ": connected") {
+		t.Fatalf("expected ': connected' in initial stream chunk, got %s", string(buf[:n]))
+	}
+
+	// Trigger shutdown: cancel rootCtx (just like SIGINT/SIGTERM in main.go)
+	rootCancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer shutdownCancel()
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- httpServer.Shutdown(shutdownCtx)
+	}()
+
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Errorf("Shutdown returned unexpected error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Shutdown timed out! Active SSE connection blocked server termination")
 	}
 }

@@ -60,3 +60,24 @@ func TestBroker_Unsubscribe(t *testing.T) {
 		t.Error("expected channel to be closed after unsubscribe")
 	}
 }
+
+func TestBroker_Close(t *testing.T) {
+	broker := New()
+	ch1 := broker.Subscribe("chan_1")
+	ch2 := broker.Subscribe("chan_2")
+
+	broker.Close()
+
+	// Both channels should be closed
+	_, ok1 := <-ch1
+	if ok1 {
+		t.Error("expected ch1 to be closed")
+	}
+	_, ok2 := <-ch2
+	if ok2 {
+		t.Error("expected ch2 to be closed")
+	}
+
+	// Calling unsubscribe after close should not panic
+	broker.Unsubscribe("chan_1", ch1)
+}
