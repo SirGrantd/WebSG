@@ -275,3 +275,72 @@ function handle(req, env) {
 		t.Errorf("expected accept for http.fetch, got false")
 	}
 }
+
+func TestEngine_ExecutionTimeout_InfiniteLoop(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptContent := `
+function handle(req, env) {
+    while (true) {} // Infinite loop to simulate CPU DoS
+    return { accept: true };
+}
+`
+	scriptPath := filepath.Join(tmpDir, "infinite_loop.js")
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0644); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+
+	eng := New(tmpDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := eng.Execute(ctx, scriptPath, nil, RequestData{})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error for infinite loop with timeout, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "timeout") {
+		t.Errorf("expected error message to mention timeout, got %q", err.Error())
+	}
+
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("execution took too long to abort: %v", elapsed)
+	}
+}
+
+func TestEngine_PKCS7Unpad_InvalidPadding(t *testing.T) {
+	// Block size 16
+	// 1. Invalid padding value > block size (e.g. 17)
+	data1 := append(bytes.Repeat([]byte("A"), 15), 17)
+	_, err1 := pkcs7Unpad(data1, 16)
+	if err1 == nil {
+		t.Errorf("expected error for padding > blockSize, got nil")
+	}
+
+	// 2. Padding value 0
+	data2 := append(bytes.Repeat([]byte("A"), 15), 0)
+	_, err2 := pkcs7Unpad(data2, 16)
+	if err2 == nil {
+		t.Errorf("expected error for padding == 0, got nil")
+	}
+
+	// 3. Inconsistent padding bytes
+	data3 := append(bytes.Repeat([]byte("A"), 13), 3, 3, 2)
+	_, err3 := pkcs7Unpad(data3, 16)
+	if err3 == nil {
+		t.Errorf("expected error for inconsistent padding bytes, got nil")
+	}
+
+	// 4. Valid padding (3 bytes of 0x03)
+	data4 := append(bytes.Repeat([]byte("A"), 13), 3, 3, 3)
+	unpadded, err4 := pkcs7Unpad(data4, 16)
+	if err4 != nil {
+		t.Fatalf("unexpected error for valid padding: %v", err4)
+	}
+	if string(unpadded) != string(bytes.Repeat([]byte("A"), 13)) {
+		t.Errorf("expected unpadded data %s, got %s", bytes.Repeat([]byte("A"), 13), unpadded)
+	}
+}

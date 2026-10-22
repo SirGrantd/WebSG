@@ -5,6 +5,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -160,6 +161,8 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	if ch.Middleware.Enabled && ch.Middleware.Script != "" {
 		reqData := engine.RequestData{
 			Method:  r.Method,
+			Route:   "ingest",
+			Channel: ch.ID,
 			Path:    r.URL.Path,
 			Headers: make(map[string]string),
 			Query:   make(map[string]string),
@@ -167,7 +170,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		}
 		for k, v := range r.Header {
 			if len(v) > 0 {
-				reqData.Headers[k] = v[0]
+				reqData.Headers[strings.ToLower(k)] = v[0]
 			}
 		}
 		for k, v := range r.URL.Query() {
@@ -176,9 +179,16 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		res, err := s.engine.Execute(r.Context(), ch.Middleware.Script, ch.Middleware.Env, reqData)
+		timeout := 3000 * time.Millisecond
+		if ch.HTTP.TimeoutMS > 0 {
+			timeout = time.Duration(ch.HTTP.TimeoutMS) * time.Millisecond
+		}
+		mCtx, mCancel := context.WithTimeout(r.Context(), timeout)
+		defer mCancel()
+
+		res, err := s.engine.Execute(mCtx, ch.Middleware.Script, ch.Middleware.Env, reqData)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"middleware error: %s"}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "middleware error: "+err.Error())
 			return
 		}
 
@@ -191,9 +201,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			if errMsg == "" {
 				errMsg = "rejected by middleware"
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(status)
-			w.Write(fmt.Appendf(nil, `{"error":%q}`, errMsg))
+			writeJSONError(w, status, errMsg)
 			return
 		}
 	}
@@ -261,11 +269,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			Body:    "",
 		}
 
-		res, err := s.engine.Execute(r.Context(), ch.StreamMiddleware.Script, ch.StreamMiddleware.Env, reqData)
+		timeout := 3000 * time.Millisecond
+		if ch.HTTP.TimeoutMS > 0 {
+			timeout = time.Duration(ch.HTTP.TimeoutMS) * time.Millisecond
+		}
+		mCtx, mCancel := context.WithTimeout(r.Context(), timeout)
+		defer mCancel()
+
+		res, err := s.engine.Execute(mCtx, ch.StreamMiddleware.Script, ch.StreamMiddleware.Env, reqData)
 		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write(fmt.Appendf(nil, `{"error":"stream middleware error: %s"}`, err.Error()))
+			writeJSONError(w, http.StatusInternalServerError, "stream middleware error: "+err.Error())
 			return
 		}
 
@@ -278,13 +291,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if errMsg == "" {
 				errMsg = "unauthorized"
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(status)
-			w.Write(fmt.Appendf(nil, `{"error":%q}`, errMsg))
+			writeJSONError(w, status, errMsg)
 			return
 		}
 	} else if !s.validateAuth(r, ch) {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -609,4 +620,11 @@ func writeSSEEvent(w io.Writer, evt *storage.Event, envelope bool) {
 		fmt.Fprintf(w, "data: %s\n", line)
 	}
 	fmt.Fprint(w, "\n")
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	b, _ := json.Marshal(map[string]string{"error": msg})
+	w.Write(b)
 }
