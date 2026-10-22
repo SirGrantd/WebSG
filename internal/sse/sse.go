@@ -40,12 +40,27 @@ func (b *Broker) Unsubscribe(channelID string, ch chan *storage.Event) {
 	defer b.mu.Unlock()
 
 	if subs, exists := b.clients[channelID]; exists {
-		delete(subs, ch)
+		if subs[ch] {
+			delete(subs, ch)
+			close(ch)
+		}
 		if len(subs) == 0 {
 			delete(b.clients, channelID)
 		}
 	}
-	close(ch)
+}
+
+// Close encerra todos os ouvintes ativos e limpa o mapa de clientes
+func (b *Broker) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for channelID, subs := range b.clients {
+		for ch := range subs {
+			close(ch)
+		}
+		delete(b.clients, channelID)
+	}
 }
 
 // Publish distribui o evento para todos os clientes conectados naquele canal

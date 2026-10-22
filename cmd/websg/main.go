@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -54,6 +55,9 @@ func main() {
 		Handler:           server.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		BaseContext: func(l net.Listener) context.Context {
+			return rootCtx
+		},
 	}
 
 	stopChan := make(chan os.Signal, 1)
@@ -72,6 +76,7 @@ func main() {
 	<-stopChan
 	log.Println("Shutting down WebSG server gracefully...")
 	rootCancel()
+	sseBroker.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
