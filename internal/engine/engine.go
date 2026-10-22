@@ -44,12 +44,20 @@ type Engine struct {
 	modulesDir string
 	mu         sync.RWMutex
 	programs   map[string]*goja.Program
+	httpClient *http.Client
 }
 
 func New(modulesDir string) *Engine {
 	return &Engine{
 		modulesDir: modulesDir,
 		programs:   make(map[string]*goja.Program),
+		httpClient: &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 20,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
 	}
 }
 
@@ -68,9 +76,23 @@ func (e *Engine) Execute(ctx context.Context, scriptPath string, env map[string]
 	}
 
 	vm := goja.New()
-	e.setupSandbox(vm)
+	e.setupSandbox(vm, ctx)
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			vm.Interrupt("execution timeout exceeded")
+		}
+	}()
 
 	if _, err := vm.RunProgram(program); err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("middleware execution timeout: %w", ctx.Err())
+		}
 		return nil, fmt.Errorf("script execution failed: %w", err)
 	}
 
@@ -98,6 +120,9 @@ func (e *Engine) Execute(ctx context.Context, scriptPath string, env map[string]
 
 	resVal, err := handleFn(goja.Undefined(), reqVal, envVal)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("middleware execution timeout: %w", ctx.Err())
+		}
 		return nil, fmt.Errorf("middleware function error: %w", err)
 	}
 
@@ -159,7 +184,7 @@ func (e *Engine) getOrCompile(path string) (*goja.Program, error) {
 	return prog, nil
 }
 
-func (e *Engine) setupSandbox(vm *goja.Runtime) {
+func (e *Engine) setupSandbox(vm *goja.Runtime, reqCtx context.Context) {
 	cryptoObj := vm.NewObject()
 
 	// crypto.hmacSha256(key, data) -> hex string
@@ -277,7 +302,10 @@ func (e *Engine) setupSandbox(vm *goja.Runtime) {
 		decrypted := make([]byte, len(ciphertext))
 		mode.CryptBlocks(decrypted, ciphertext)
 
-		unpadded, _ := pkcs7Unpad(decrypted, aes.BlockSize)
+		unpadded, err := pkcs7Unpad(decrypted, aes.BlockSize)
+		if err != nil {
+			return vm.ToValue("")
+		}
 		return vm.ToValue(string(unpadded))
 	})
 
@@ -298,7 +326,7 @@ func (e *Engine) setupSandbox(vm *goja.Runtime) {
 			timeoutMs = 10000
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+		ctx, cancel := context.WithTimeout(reqCtx, time.Duration(timeoutMs)*time.Millisecond)
 		defer cancel()
 
 		var reqBody io.Reader
@@ -320,8 +348,7 @@ func (e *Engine) setupSandbox(vm *goja.Runtime) {
 			httpReq.Header.Set(k, v)
 		}
 
-		client := &http.Client{Timeout: time.Duration(timeoutMs) * time.Millisecond}
-		resp, err := client.Do(httpReq)
+		resp, err := e.httpClient.Do(httpReq)
 		if err != nil {
 			return map[string]any{
 				"status": 0,
@@ -420,13 +447,16 @@ func pkcs7Unpad(data []byte, blockSize int) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty data")
 	}
+	if len(data)%blockSize != 0 {
+		return nil, fmt.Errorf("data length is not a multiple of blockSize")
+	}
 	padding := int(data[len(data)-1])
 	if padding == 0 || padding > blockSize || padding > len(data) {
-		return data, nil
+		return nil, fmt.Errorf("invalid padding length: %d", padding)
 	}
 	for i := len(data) - padding; i < len(data); i++ {
 		if int(data[i]) != padding {
-			return data, nil
+			return nil, fmt.Errorf("invalid padding byte at index %d", i)
 		}
 	}
 	return data[:len(data)-padding], nil
