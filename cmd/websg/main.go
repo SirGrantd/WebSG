@@ -63,6 +63,9 @@ func main() {
 		log.Printf("[WebSG] Storage initialized (SQLite WAL: %s)", cfg.DatabasePath)
 		log.Printf("[WebSG] Loaded %d channel(s): %v", len(channelIDs), channelIDs)
 		log.Printf("[WebSG] Housekeeper active (interval: %v, acked retention: %v, TTL: %v)", cfg.HousekeepingInterval, cfg.AckedRetention, cfg.UnackedRetention)
+		if cfg.IsDefaultAdminToken {
+			log.Println("[WebSG] SECURITY WARNING: Using default admin token ('websg_admin_dev'). Set WEBSG_ADMIN_TOKEN in production environment!")
+		}
 		log.Printf("[WebSG] Server listening on :%s (Headless Mode)", cfg.Port)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http server error: %v", err)

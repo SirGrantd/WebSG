@@ -4,6 +4,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -331,12 +332,61 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
-		http.Error(w, `{"error":"event id is required"}`, http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"event id is required"}`))
 		return
 	}
 
-	if err := s.storage.AckEvent(r.Context(), id); err != nil {
-		http.Error(w, `{"error":"failed to ack event"}`, http.StatusInternalServerError)
+	channelID := r.URL.Query().Get("channel")
+	if channelID == "" {
+		channelID = r.Header.Get("X-Channel")
+	}
+
+	if channelID == "" {
+		discoveredChan, err := s.storage.GetEventChannel(r.Context(), id)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"failed to query event"}`))
+			return
+		}
+		if discoveredChan == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":"event not found"}`))
+			return
+		}
+		channelID = discoveredChan
+	}
+
+	authorized := s.validateAdminAuth(r)
+	if !authorized {
+		ch, exists := s.cfg.GetChannel(channelID)
+		if exists && s.validateAuth(r, ch) {
+			authorized = true
+		}
+	}
+
+	if !authorized {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+
+	acked, err := s.storage.AckEvent(r.Context(), id, channelID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"failed to ack event"}`))
+		return
+	}
+
+	if !acked {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"event not found"}`))
 		return
 	}
 
@@ -357,25 +407,32 @@ func isMethodAllowed(method string, allowed []string) bool {
 	return false
 }
 
+func secureCompare(a, b string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
 func (s *Server) validateAuth(r *http.Request, ch *config.ChannelConfig) bool {
 	if ch.Auth.Type == "none" || ch.Auth.Token == "" {
 		return true
 	}
 
 	queryToken := r.URL.Query().Get("token")
-	if queryToken != "" && queryToken == ch.Auth.Token {
+	if queryToken != "" && secureCompare(queryToken, ch.Auth.Token) {
 		return true
 	}
 
 	headerToken := r.Header.Get("X-Token")
-	if headerToken != "" && headerToken == ch.Auth.Token {
+	if headerToken != "" && secureCompare(headerToken, ch.Auth.Token) {
 		return true
 	}
 
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if token == ch.Auth.Token {
+		if secureCompare(token, ch.Auth.Token) {
 			return true
 		}
 	}
@@ -389,19 +446,19 @@ func (s *Server) validateAdminAuth(r *http.Request) bool {
 		return true
 	}
 
-	if r.Header.Get("X-Admin-Token") == adminToken {
+	if secureCompare(r.Header.Get("X-Admin-Token"), adminToken) {
 		return true
 	}
 
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if token == adminToken {
+		if secureCompare(token, adminToken) {
 			return true
 		}
 	}
 
-	if r.URL.Query().Get("admin_token") == adminToken {
+	if secureCompare(r.URL.Query().Get("admin_token"), adminToken) {
 		return true
 	}
 

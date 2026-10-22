@@ -6,6 +6,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -244,13 +245,43 @@ func (s *Storage) GetEventsAfter(ctx context.Context, channelID string, lastEven
 	return events, rows.Err()
 }
 
-func (s *Storage) AckEvent(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE events
-		SET status = 'acked', acked_at = CURRENT_TIMESTAMP
-		WHERE id = ?
-	`, id)
-	return err
+func (s *Storage) GetEventChannel(ctx context.Context, id string) (string, error) {
+	var channelID string
+	err := s.db.QueryRowContext(ctx, "SELECT channel_id FROM events WHERE id = ?", id).Scan(&channelID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return channelID, nil
+}
+
+func (s *Storage) AckEvent(ctx context.Context, id, channelID string) (bool, error) {
+	var res sql.Result
+	var err error
+	if channelID != "" {
+		res, err = s.db.ExecContext(ctx, `
+			UPDATE events
+			SET status = 'acked', acked_at = CURRENT_TIMESTAMP
+			WHERE id = ? AND channel_id = ?
+		`, id, channelID)
+	} else {
+		res, err = s.db.ExecContext(ctx, `
+			UPDATE events
+			SET status = 'acked', acked_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+		`, id)
+	}
+	if err != nil {
+		return false, err
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
 func (s *Storage) PruneEvents(ctx context.Context, ackedCutoff, unackedCutoff time.Time) (int64, error) {

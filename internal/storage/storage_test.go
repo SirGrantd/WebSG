@@ -145,9 +145,40 @@ func TestStorage_GetEventsAfter_And_Ack(t *testing.T) {
 		t.Errorf("expected [evt2, evt3], got [%s, %s]", missed[0].ID, missed[1].ID)
 	}
 
-	// Ack evt2
-	if err := s.AckEvent(ctx, evt2.ID); err != nil {
+	// Ack evt2 with correct channel
+	acked, err := s.AckEvent(ctx, evt2.ID, evt2.ChannelID)
+	if err != nil {
 		t.Fatalf("failed to ack evt2: %v", err)
+	}
+	if !acked {
+		t.Fatalf("expected evt2 to be acked")
+	}
+
+	// Ack with wrong channel -> should return false
+	wrongAck, err := s.AckEvent(ctx, evt3.ID, "wrong_chan")
+	if err != nil {
+		t.Fatalf("unexpected error for wrong channel ack: %v", err)
+	}
+	if wrongAck {
+		t.Errorf("expected wrongAck to be false for mismatched channel")
+	}
+
+	// Ack non-existent event -> should return false
+	fakeAck, err := s.AckEvent(ctx, "non_existent_ulid", "")
+	if err != nil {
+		t.Fatalf("unexpected error for non-existent ack: %v", err)
+	}
+	if fakeAck {
+		t.Errorf("expected fakeAck to be false")
+	}
+
+	// Verify GetEventChannel
+	chanID, err := s.GetEventChannel(ctx, evt2.ID)
+	if err != nil {
+		t.Fatalf("GetEventChannel failed: %v", err)
+	}
+	if chanID != evt2.ChannelID {
+		t.Errorf("expected channel %s, got %s", evt2.ChannelID, chanID)
 	}
 
 	// Verify status in DB
@@ -192,8 +223,8 @@ func TestStorage_PruneEvents(t *testing.T) {
 		t.Fatalf("failed to insert event: %v", err)
 	}
 
-	_ = s.AckEvent(ctx, evtRecentAcked.ID)
-	_ = s.AckEvent(ctx, evtOldAcked.ID)
+	_, _ = s.AckEvent(ctx, evtRecentAcked.ID, "chan_prune")
+	_, _ = s.AckEvent(ctx, evtOldAcked.ID, "chan_prune")
 
 	oldAckedDate := time.Now().Add(-48 * time.Hour).UTC().Format("2006-01-02 15:04:05")
 	_, err = s.db.Exec("UPDATE events SET created_at = ?, acked_at = ? WHERE id = ?", oldAckedDate, oldAckedDate, evtOldAcked.ID)
