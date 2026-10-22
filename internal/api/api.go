@@ -29,6 +29,14 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config, store *storage.Storage, eng *engine.Engine, broker *sse.Broker) *Server {
+	if cfg != nil && store != nil {
+		var records []storage.ChannelRecord
+		for _, ch := range cfg.Channels {
+			records = append(records, storage.ChannelRecord{ID: ch.ID, Name: ch.Name})
+		}
+		_ = store.SyncChannels(records)
+	}
+
 	return &Server{
 		cfg:     cfg,
 		storage: store,
@@ -301,18 +309,30 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	envelopeMode := r.URL.Query().Get("format") == "envelope" || r.URL.Query().Get("envelope") == "true"
 
-	if lastEventID != "" {
-		missedEvents, err := s.storage.GetEventsAfter(r.Context(), ch.ID, lastEventID, 100)
-		if err == nil {
-			for _, evt := range missedEvents {
-				writeSSEEvent(w, evt, envelopeMode)
-			}
-			flusher.Flush()
-		}
-	}
-
 	eventChan := s.sse.Subscribe(ch.ID)
 	defer s.sse.Unsubscribe(ch.ID, eventChan)
+
+	lastDeliveredID := lastEventID
+
+	if lastEventID != "" {
+		cursor := lastEventID
+		const pageSize = 100
+		for {
+			chunk, err := s.storage.GetEventsAfter(r.Context(), ch.ID, cursor, pageSize)
+			if err != nil || len(chunk) == 0 {
+				break
+			}
+			for _, evt := range chunk {
+				writeSSEEvent(w, evt, envelopeMode)
+				cursor = evt.ID
+				lastDeliveredID = evt.ID
+			}
+			flusher.Flush()
+			if len(chunk) < pageSize {
+				break
+			}
+		}
+	}
 
 	fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
@@ -331,8 +351,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			if lastDeliveredID != "" && evt.ID <= lastDeliveredID {
+				continue
+			}
 			writeSSEEvent(w, evt, envelopeMode)
 			flusher.Flush()
+			lastDeliveredID = evt.ID
 		}
 	}
 }

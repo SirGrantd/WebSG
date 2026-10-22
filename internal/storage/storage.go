@@ -5,10 +5,13 @@ package storage
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -26,19 +29,24 @@ type Event struct {
 }
 
 type writeTask struct {
-	event *Event
-	errCh chan error
+	channelID   string
+	eventType   string
+	headersJSON string
+	payload     []byte
+	resultEvt   *Event
+	errCh       chan error
 }
 
 type Storage struct {
 	db         *sql.DB
 	insertStmt *sql.Stmt
-	writeChan  chan writeTask
-	closeChan  chan struct{}
+	writeChan  chan *writeTask
+	wg         sync.WaitGroup
+	entropy    io.Reader
 }
 
 func New(dbPath string) (*Storage, error) {
-	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-16000)", dbPath)
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-16000)&_pragma=foreign_keys(1)", dbPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
@@ -48,8 +56,8 @@ func New(dbPath string) (*Storage, error) {
 
 	s := &Storage{
 		db:        db,
-		writeChan: make(chan writeTask, 1000),
-		closeChan: make(chan struct{}),
+		writeChan: make(chan *writeTask, 1000),
+		entropy:   ulid.Monotonic(rand.Reader, 0),
 	}
 
 	if err := s.migrate(); err != nil {
@@ -67,6 +75,7 @@ func New(dbPath string) (*Storage, error) {
 	}
 	s.insertStmt = insertStmt
 
+	s.wg.Add(1)
 	go s.writerLoop()
 
 	return s, nil
@@ -101,38 +110,43 @@ func (s *Storage) migrate() error {
 }
 
 func (s *Storage) writerLoop() {
-	for {
-		select {
-		case <-s.closeChan:
-			return
-		case task := <-s.writeChan:
-			_, execErr := s.insertStmt.Exec(
-				task.event.ID,
-				task.event.ChannelID,
-				task.event.EventType,
-				task.event.HeadersJSON,
-				task.event.Payload,
-				task.event.Status,
-			)
-			task.errCh <- execErr
+	defer s.wg.Done()
+	for task := range s.writeChan {
+		id, err := ulid.New(ulid.Timestamp(time.Now()), s.entropy)
+		if err != nil {
+			id = ulid.Make()
 		}
+
+		evt := &Event{
+			ID:          id.String(),
+			ChannelID:   task.channelID,
+			EventType:   task.eventType,
+			HeadersJSON: task.headersJSON,
+			Payload:     task.payload,
+			Status:      "pending",
+			CreatedAt:   time.Now(),
+		}
+
+		_, execErr := s.insertStmt.Exec(
+			evt.ID,
+			evt.ChannelID,
+			evt.EventType,
+			evt.HeadersJSON,
+			evt.Payload,
+			evt.Status,
+		)
+		task.resultEvt = evt
+		task.errCh <- execErr
 	}
 }
 
 func (s *Storage) InsertEvent(ctx context.Context, channelID, eventType, headersJSON string, payload []byte) (*Event, error) {
-	evt := &Event{
-		ID:          ulid.Make().String(),
-		ChannelID:   channelID,
-		EventType:   eventType,
-		HeadersJSON: headersJSON,
-		Payload:     payload,
-		Status:      "pending",
-		CreatedAt:   time.Now(),
-	}
-
-	task := writeTask{
-		event: evt,
-		errCh: make(chan error, 1),
+	task := &writeTask{
+		channelID:   channelID,
+		eventType:   eventType,
+		headersJSON: headersJSON,
+		payload:     payload,
+		errCh:       make(chan error, 1),
 	}
 
 	select {
@@ -148,7 +162,7 @@ func (s *Storage) InsertEvent(ctx context.Context, channelID, eventType, headers
 		if err != nil {
 			return nil, err
 		}
-		return evt, nil
+		return task.resultEvt, nil
 	}
 }
 
@@ -328,7 +342,8 @@ func (s *Storage) StartHousekeeper(ctx context.Context, interval, ackedRetention
 }
 
 func (s *Storage) Close() error {
-	close(s.closeChan)
+	close(s.writeChan)
+	s.wg.Wait()
 	if s.insertStmt != nil {
 		s.insertStmt.Close()
 	}
