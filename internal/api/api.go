@@ -4,6 +4,7 @@
 package api
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -140,6 +141,11 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	eventType := r.URL.Query().Get("event_type")
 	if eventType == "" {
 		eventType = "webhook"
+	} else if !isValidEventType(eventType) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write(fmt.Appendf(nil, `{"error":"invalid event_type: only alphanumeric, underscore, hyphen and dot are allowed"}`))
+		return
 	}
 
 	if ch.Middleware.Enabled && ch.Middleware.Script != "" {
@@ -292,11 +298,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		lastEventID = r.URL.Query().Get("last_event_id")
 	}
 
+	envelopeMode := r.URL.Query().Get("format") == "envelope" || r.URL.Query().Get("envelope") == "true"
+
 	if lastEventID != "" {
 		missedEvents, err := s.storage.GetEventsAfter(r.Context(), ch.ID, lastEventID, 100)
 		if err == nil {
 			for _, evt := range missedEvents {
-				fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", evt.ID, evt.EventType, evt.Payload)
+				writeSSEEvent(w, evt, envelopeMode)
 			}
 			flusher.Flush()
 		}
@@ -322,7 +330,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", evt.ID, evt.EventType, evt.Payload)
+			writeSSEEvent(w, evt, envelopeMode)
 			flusher.Flush()
 		}
 	}
@@ -462,4 +470,62 @@ func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request, ch *config.Ch
 	}
 	w.Header().Set("Access-Control-Allow-Headers", allowedHeaders)
 	w.Header().Set("Access-Control-Expose-Headers", "X-Event-ID")
+}
+
+func isValidEventType(t string) bool {
+	if len(t) == 0 || len(t) > 64 {
+		return false
+	}
+	for _, r := range t {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+func writeSSEEvent(w io.Writer, evt *storage.Event, envelope bool) {
+	if envelope {
+		headers := json.RawMessage(evt.HeadersJSON)
+		if len(headers) == 0 {
+			headers = json.RawMessage("{}")
+		}
+
+		type SSEEnvelope struct {
+			ID        string          `json:"id"`
+			ChannelID string          `json:"channel_id"`
+			EventType string          `json:"event_type"`
+			CreatedAt time.Time       `json:"created_at"`
+			Headers   json.RawMessage `json:"headers"`
+			Payload   any             `json:"payload"`
+		}
+
+		var payloadVal any
+		if json.Valid(evt.Payload) {
+			payloadVal = json.RawMessage(evt.Payload)
+		} else {
+			payloadVal = string(evt.Payload)
+		}
+
+		envBytes, err := json.Marshal(SSEEnvelope{
+			ID:        evt.ID,
+			ChannelID: evt.ChannelID,
+			EventType: evt.EventType,
+			CreatedAt: evt.CreatedAt,
+			Headers:   headers,
+			Payload:   payloadVal,
+		})
+		if err == nil {
+			fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", evt.ID, evt.EventType, envBytes)
+			return
+		}
+	}
+
+	fmt.Fprintf(w, "id: %s\nevent: %s\n", evt.ID, evt.EventType)
+	normalized := bytes.ReplaceAll(evt.Payload, []byte("\r\n"), []byte("\n"))
+	lines := bytes.Split(normalized, []byte("\n"))
+	for _, line := range lines {
+		fmt.Fprintf(w, "data: %s\n", line)
+	}
+	fmt.Fprint(w, "\n")
 }
