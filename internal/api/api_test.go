@@ -6,6 +6,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -459,5 +460,44 @@ function handle(req, env) {
 
 	if contentType := okRec.Header().Get("Content-Type"); contentType != "text/event-stream" {
 		t.Errorf("expected Content-Type text/event-stream, got %q", contentType)
+	}
+}
+
+func TestStream_ReplayPaginatesOver100Events(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Ingest 125 events into open channel test_open
+	const totalEvents = 125
+	eventIDs := make([]string, totalEvents)
+	for i := 0; i < totalEvents; i++ {
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open", bytes.NewReader([]byte(fmt.Sprintf(`{"idx":%d}`, i)))))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("ingest failed on event %d: %s", i, rec.Body.String())
+		}
+		eventIDs[i] = rec.Header().Get("X-Event-ID")
+	}
+
+	// Replay from beginning (Last-Event-ID = "00000000000000000000000000")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_open", nil).WithContext(ctx)
+	streamReq.Header.Set("Last-Event-ID", "00000000000000000000000000")
+	streamRec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(streamRec, streamReq)
+	output := streamRec.Body.String()
+
+	// Verify that BOTH event 0 and event 124 (past the old 100 limit) were delivered in replay
+	if !strings.Contains(output, eventIDs[0]) {
+		t.Errorf("expected replay to contain first event %s", eventIDs[0])
+	}
+	if !strings.Contains(output, eventIDs[100]) {
+		t.Errorf("expected replay to paginate past event 100, but missing event 100 (%s)", eventIDs[100])
+	}
+	if !strings.Contains(output, eventIDs[totalEvents-1]) {
+		t.Errorf("expected replay to contain final event %d (%s)", totalEvents-1, eventIDs[totalEvents-1])
 	}
 }

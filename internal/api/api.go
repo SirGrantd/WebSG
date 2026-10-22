@@ -27,6 +27,14 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config, store *storage.Storage, eng *engine.Engine, broker *sse.Broker) *Server {
+	if cfg != nil && store != nil {
+		var records []storage.ChannelRecord
+		for _, ch := range cfg.Channels {
+			records = append(records, storage.ChannelRecord{ID: ch.ID, Name: ch.Name})
+		}
+		_ = store.SyncChannels(records)
+	}
+
 	return &Server{
 		cfg:     cfg,
 		storage: store,
@@ -292,18 +300,30 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		lastEventID = r.URL.Query().Get("last_event_id")
 	}
 
-	if lastEventID != "" {
-		missedEvents, err := s.storage.GetEventsAfter(r.Context(), ch.ID, lastEventID, 100)
-		if err == nil {
-			for _, evt := range missedEvents {
-				fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", evt.ID, evt.EventType, evt.Payload)
-			}
-			flusher.Flush()
-		}
-	}
-
 	eventChan := s.sse.Subscribe(ch.ID)
 	defer s.sse.Unsubscribe(ch.ID, eventChan)
+
+	lastDeliveredID := lastEventID
+
+	if lastEventID != "" {
+		cursor := lastEventID
+		const pageSize = 100
+		for {
+			chunk, err := s.storage.GetEventsAfter(r.Context(), ch.ID, cursor, pageSize)
+			if err != nil || len(chunk) == 0 {
+				break
+			}
+			for _, evt := range chunk {
+				fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", evt.ID, evt.EventType, evt.Payload)
+				cursor = evt.ID
+				lastDeliveredID = evt.ID
+			}
+			flusher.Flush()
+			if len(chunk) < pageSize {
+				break
+			}
+		}
+	}
 
 	fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
@@ -322,8 +342,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			if lastDeliveredID != "" && evt.ID <= lastDeliveredID {
+				continue
+			}
 			fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", evt.ID, evt.EventType, evt.Payload)
 			flusher.Flush()
+			lastDeliveredID = evt.ID
 		}
 	}
 }

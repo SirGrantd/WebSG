@@ -5,6 +5,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ func TestStorage_InsertEvent(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+	_ = s.SyncChannels([]ChannelRecord{{ID: "chan_test", Name: "Test Channel"}})
 	evt, err := s.InsertEvent(ctx, "chan_test", "webhook", `{"Content-Type":"application/json"}`, []byte(`{"test":true}`))
 	if err != nil {
 		t.Fatalf("failed to insert event: %v", err)
@@ -95,6 +97,10 @@ func TestStorage_ListEvents(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+	_ = s.SyncChannels([]ChannelRecord{
+		{ID: "chan_a", Name: "Channel A"},
+		{ID: "chan_b", Name: "Channel B"},
+	})
 	_, _ = s.InsertEvent(ctx, "chan_a", "webhook", `{}`, []byte(`{"a":1}`))
 	_, _ = s.InsertEvent(ctx, "chan_b", "webhook", `{}`, []byte(`{"b":2}`))
 	_, _ = s.InsertEvent(ctx, "chan_a", "webhook", `{}`, []byte(`{"a":3}`))
@@ -129,6 +135,7 @@ func TestStorage_GetEventsAfter_And_Ack(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+	_ = s.SyncChannels([]ChannelRecord{{ID: "chan_x", Name: "Channel X"}})
 	evt1, _ := s.InsertEvent(ctx, "chan_x", "webhook", `{}`, []byte(`{"order":1}`))
 	evt2, _ := s.InsertEvent(ctx, "chan_x", "webhook", `{}`, []byte(`{"order":2}`))
 	evt3, _ := s.InsertEvent(ctx, "chan_x", "webhook", `{}`, []byte(`{"order":3}`))
@@ -174,6 +181,7 @@ func TestStorage_PruneEvents(t *testing.T) {
 	defer s.Close()
 
 	ctx := context.Background()
+	_ = s.SyncChannels([]ChannelRecord{{ID: "chan_prune", Name: "Channel Prune"}})
 
 	evtRecentPending, err := s.InsertEvent(ctx, "chan_prune", "webhook", `{}`, []byte(`{"recent":true}`))
 	if err != nil {
@@ -229,5 +237,83 @@ func TestStorage_PruneEvents(t *testing.T) {
 	remainingIDs := map[string]bool{remaining[0].ID: true, remaining[1].ID: true}
 	if !remainingIDs[evtRecentPending.ID] || !remainingIDs[evtRecentAcked.ID] {
 		t.Errorf("expected recent events to remain in storage")
+	}
+}
+
+func TestStorage_ForeignKeyEnforcement(t *testing.T) {
+	dbPath := "test_fk.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-wal")
+	defer os.Remove(dbPath + "-shm")
+
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init storage: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	// Attempting to insert an event for a channel that has NOT been synced should fail foreign key check
+	_, err = s.InsertEvent(ctx, "non_existent_chan", "webhook", `{}`, []byte(`{}`))
+	if err == nil {
+		t.Errorf("expected foreign key constraint violation error for non-existent channel, got nil")
+	}
+}
+
+func TestStorage_MonotonicULIDOrdering(t *testing.T) {
+	dbPath := "test_ulid_order.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-wal")
+	defer os.Remove(dbPath + "-shm")
+
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init storage: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	_ = s.SyncChannels([]ChannelRecord{{ID: "chan_mono", Name: "Monotonic Chan"}})
+
+	const numEvents = 50
+	events := make([]*Event, numEvents)
+	for i := 0; i < numEvents; i++ {
+		evt, err := s.InsertEvent(ctx, "chan_mono", "webhook", `{}`, []byte(fmt.Sprintf(`{"i":%d}`, i)))
+		if err != nil {
+			t.Fatalf("failed to insert event %d: %v", i, err)
+		}
+		events[i] = evt
+	}
+
+	// Verify that each subsequent ULID is strictly greater than the previous one
+	for i := 1; i < numEvents; i++ {
+		if events[i].ID <= events[i-1].ID {
+			t.Errorf("ULID not monotonic: event[%d].ID (%s) <= event[%d].ID (%s)", i, events[i].ID, i-1, events[i-1].ID)
+		}
+	}
+}
+
+func TestStorage_CloseDrainsTasks(t *testing.T) {
+	dbPath := "test_drain.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-wal")
+	defer os.Remove(dbPath + "-shm")
+
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init storage: %v", err)
+	}
+
+	ctx := context.Background()
+	_ = s.SyncChannels([]ChannelRecord{{ID: "chan_drain", Name: "Drain Chan"}})
+
+	_, err = s.InsertEvent(ctx, "chan_drain", "webhook", `{}`, []byte(`{"drain":1}`))
+	if err != nil {
+		t.Fatalf("failed to insert event: %v", err)
+	}
+
+	// Close waits for worker to finish and drains cleanly
+	if err := s.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
 	}
 }
