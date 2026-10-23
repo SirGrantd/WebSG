@@ -4,6 +4,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -155,8 +157,16 @@ func Load() *Config {
 	isDefaultAdmin := false
 	adminToken := os.Getenv("WEBSG_ADMIN_TOKEN")
 	if adminToken == "" {
-		adminToken = "websg_admin_dev"
-		isDefaultAdmin = true
+		env := strings.ToLower(strings.TrimSpace(os.Getenv("WEBSG_ENV")))
+		if env == "production" || env == "prod" {
+			b := make([]byte, 16)
+			_, _ = rand.Read(b)
+			adminToken = hex.EncodeToString(b)
+			isDefaultAdmin = true
+		} else {
+			adminToken = "websg_admin_dev"
+			isDefaultAdmin = true
+		}
 	}
 
 	encryptionKey := os.Getenv("WEBSG_ENCRYPTION_KEY")

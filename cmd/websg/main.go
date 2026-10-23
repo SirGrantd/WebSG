@@ -30,14 +30,9 @@ func main() {
 	}
 	defer store.Close()
 
-	var records []storage.ChannelRecord
 	var channelIDs []string
-	for id, ch := range cfg.Channels {
-		records = append(records, storage.ChannelRecord{ID: ch.ID, Name: ch.Name})
+	for id := range cfg.Channels {
 		channelIDs = append(channelIDs, id)
-	}
-	if err := store.SyncChannels(records); err != nil {
-		log.Printf("[WebSG] Warning: failed to sync channels to database: %v", err)
 	}
 
 	jsEngine := engine.New(cfg.ModulesDir)
@@ -87,7 +82,11 @@ func main() {
 		log.Printf("[WebSG] Loaded %d channel(s): %v", len(channelIDs), channelIDs)
 		log.Printf("[WebSG] Housekeeper active (interval: %v, acked retention: %v, TTL: %v)", cfg.HousekeepingInterval, cfg.AckedRetention, cfg.UnackedRetention)
 		if cfg.IsDefaultAdminToken {
-			log.Println("[WebSG] SECURITY WARNING: Using default admin token ('websg_admin_dev'). Set WEBSG_ADMIN_TOKEN in production environment!")
+			if cfg.AdminToken == "websg_admin_dev" {
+				log.Println("[WebSG] SECURITY WARNING: Using default dev admin token ('websg_admin_dev'). Set WEBSG_ADMIN_TOKEN in production environment!")
+			} else {
+				log.Printf("[WebSG] SECURITY NOTICE: Generated random admin token for this session: %s", cfg.AdminToken)
+			}
 		}
 		log.Printf("[WebSG] Server listening on :%s (Headless Mode)", cfg.Port)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

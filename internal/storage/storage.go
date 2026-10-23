@@ -252,8 +252,10 @@ func (s *Storage) writerLoop() {
 			}
 		}
 
+		now := time.Now().UTC()
+		nowSec := now.Truncate(time.Second)
 		for _, t := range tasks {
-			id, err := ulid.New(ulid.Timestamp(time.Now()), s.entropy)
+			id, err := ulid.New(ulid.Timestamp(now), s.entropy)
 			if err != nil {
 				id = ulid.Make()
 			}
@@ -264,7 +266,7 @@ func (s *Storage) writerLoop() {
 				HeadersJSON: t.headersJSON,
 				Payload:     t.payload,
 				Status:      "pending",
-				CreatedAt:   time.Now(),
+				CreatedAt:   nowSec,
 			}
 		}
 

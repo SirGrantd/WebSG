@@ -149,3 +149,19 @@ func TestAuthConfig_TokenSegregation(t *testing.T) {
 		t.Errorf("expected GetStreamToken() = 'client_secret', got %q", alias.GetStreamToken())
 	}
 }
+
+func TestConfig_ProductionAdminTokenGeneration(t *testing.T) {
+	t.Setenv("WEBSG_ENV", "production")
+	t.Setenv("WEBSG_ADMIN_TOKEN", "")
+
+	cfg := Load()
+	if !cfg.IsDefaultAdminToken {
+		t.Errorf("expected IsDefaultAdminToken to be true")
+	}
+	if cfg.AdminToken == "websg_admin_dev" {
+		t.Errorf("security failure: production environment used websg_admin_dev")
+	}
+	if len(cfg.AdminToken) != 32 {
+		t.Errorf("expected 32-char hex admin token in production, got %q (len %d)", cfg.AdminToken, len(cfg.AdminToken))
+	}
+}
