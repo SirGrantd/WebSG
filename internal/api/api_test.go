@@ -1186,3 +1186,181 @@ func TestManualReplay_Stats_And_EventFilters(t *testing.T) {
 		t.Errorf("expected stats to report 1 pending and 1 acked event, got: %s", statsRec.Body.String())
 	}
 }
+
+func TestIngest_SanitizesSensitiveHeadersInEnvelope(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	ingestReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=order.created", bytes.NewReader([]byte(`{"total":99.9}`)))
+	ingestReq.Header.Set("Authorization", "Bearer super_secret_ingest_token")
+	ingestReq.Header.Set("Proxy-Authorization", "Basic dXNlcjpwYXNz")
+	ingestReq.Header.Set("X-Token", "header_token_secret_456")
+	ingestReq.Header.Set("X-Admin-Token", "admin_secret_leak_attempt")
+	ingestReq.Header.Set("Cookie", "session=leak_session_cookie")
+	ingestReq.Header.Set("Set-Cookie", "auth=leak_auth_cookie")
+	ingestReq.Header.Set("X-Custom-Safe-Header", "safe_meta_value_123")
+	ingestReq.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, ingestReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ingest failed with status %d: %s", rec.Code, rec.Body.String())
+	}
+	evtID := rec.Header().Get("X-Event-ID")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_open&format=envelope", nil).WithContext(ctx)
+	streamReq.Header.Set("Last-Event-ID", "00000000000000000000000000")
+	streamRec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(streamRec, streamReq)
+	output := streamRec.Body.String()
+
+	if !strings.Contains(output, "id: "+evtID) {
+		t.Fatalf("expected stream to contain event id %s, got:\n%s", evtID, output)
+	}
+
+	sensitiveSubstrings := []string{
+		"super_secret_ingest_token",
+		"header_token_secret_456",
+		"admin_secret_leak_attempt",
+		"leak_session_cookie",
+		"leak_auth_cookie",
+		"Basic dXNlcjpwYXNz",
+	}
+	for _, sens := range sensitiveSubstrings {
+		if strings.Contains(output, sens) {
+			t.Errorf("security vulnerability: sensitive value %q leaked in envelope output:\n%s", sens, output)
+		}
+	}
+
+	if !strings.Contains(output, "safe_meta_value_123") {
+		t.Errorf("expected safe header 'safe_meta_value_123' to be preserved in envelope, got:\n%s", output)
+	}
+}
+
+func TestStreamMiddleware_EnforcedOnAckAndReplay(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptContent := `
+function handle(req, env) {
+    var token = req.query.token;
+    if (!token && req.headers["authorization"]) {
+        if (req.headers["authorization"].indexOf("Bearer ") === 0) {
+            token = req.headers["authorization"].substring(7);
+        }
+    }
+    if (token === "valid_erp_stream_jwt") {
+        return { accept: true };
+    }
+    return { accept: false, status: 401, error: "Access denied by stream middleware" };
+}
+`
+	scriptPath := filepath.Join(tmpDir, "unified_stream_mw.js")
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0644); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+
+	dbPath := filepath.Join(tmpDir, "test_unified_mw.db")
+	store, err := storage.New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init storage: %v", err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{
+		Port:        "8080",
+		ChannelsDir: tmpDir,
+		AdminToken:  "master_admin_token",
+		Channels: map[string]*config.ChannelConfig{
+			"chan_unified": {
+				ID:   "chan_unified",
+				Name: "Unified MW Channel",
+				HTTP: config.HTTPConfig{
+					AllowedMethods: []string{"POST"},
+					SuccessStatus:  200,
+				},
+				Auth: config.AuthConfig{Type: "none"},
+				StreamMiddleware: config.MiddlewareConfig{
+					Enabled: true,
+					Script:  scriptPath,
+				},
+			},
+		},
+	}
+
+	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
+
+	// 1. Ingest an event (open ingest since auth.type is none)
+	ingestRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ingestRec, httptest.NewRequest(http.MethodPost, "/v1/ingest/chan_unified", bytes.NewReader([]byte(`{"order":55}`))))
+	if ingestRec.Code != http.StatusOK {
+		t.Fatalf("ingest failed: %d", ingestRec.Code)
+	}
+	evtID := ingestRec.Header().Get("X-Event-ID")
+
+	// 2. Unauthenticated Stream -> 401
+	streamRec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(streamRec1, httptest.NewRequest(http.MethodGet, "/v1/stream?channel=chan_unified", nil))
+	if streamRec1.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated stream, got %d", streamRec1.Code)
+	}
+
+	// 3. Unauthenticated Ack -> 401
+	ackRec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ackRec1, httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack?channel=chan_unified", nil))
+	if ackRec1.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated ack on channel with stream_middleware, got %d", ackRec1.Code)
+	}
+
+	// 4. Authenticated Ack with valid token -> 200 OK
+	ackReq2 := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack?channel=chan_unified", nil)
+	ackReq2.Header.Set("Authorization", "Bearer valid_erp_stream_jwt")
+	ackRec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ackRec2, ackReq2)
+	if ackRec2.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for authenticated ack, got %d. Body: %s", ackRec2.Code, ackRec2.Body.String())
+	}
+
+	// 5. Ingest second event for Batch Ack & Replay tests
+	ingestRec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ingestRec2, httptest.NewRequest(http.MethodPost, "/v1/ingest/chan_unified", bytes.NewReader([]byte(`{"order":56}`))))
+	evt2ID := ingestRec2.Header().Get("X-Event-ID")
+
+	// 6. Unauthenticated Batch Ack -> 401
+	batchBody, _ := json.Marshal(map[string]any{
+		"channel": "chan_unified",
+		"ids":     []string{evt2ID},
+	})
+	batchRec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(batchRec1, httptest.NewRequest(http.MethodPost, "/v1/events/ack-batch", bytes.NewReader(batchBody)))
+	if batchRec1.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated ack-batch on channel with stream_middleware, got %d", batchRec1.Code)
+	}
+
+	// 7. Authenticated Batch Ack -> 200 OK
+	batchReq2 := httptest.NewRequest(http.MethodPost, "/v1/events/ack-batch", bytes.NewReader(batchBody))
+	batchReq2.Header.Set("Authorization", "Bearer valid_erp_stream_jwt")
+	batchRec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(batchRec2, batchReq2)
+	if batchRec2.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for authenticated ack-batch, got %d: %s", batchRec2.Code, batchRec2.Body.String())
+	}
+
+	// 8. Unauthenticated Replay Event -> 401
+	replayRec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(replayRec1, httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/replay", nil))
+	if replayRec1.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated replay on channel with stream_middleware, got %d", replayRec1.Code)
+	}
+
+	// 9. Authenticated Replay Event -> 200 OK
+	replayReq2 := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/replay", nil)
+	replayReq2.Header.Set("Authorization", "Bearer valid_erp_stream_jwt")
+	replayRec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(replayRec2, replayReq2)
+	if replayRec2.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for authenticated replay, got %d: %s", replayRec2.Code, replayRec2.Body.String())
+	}
+}

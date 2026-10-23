@@ -240,7 +240,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	headersJSON, err := json.Marshal(r.Header)
+	headersJSON, err := json.Marshal(sanitizeHeaders(r.Header))
 	if err != nil {
 		headersJSON = []byte("{}")
 	}
@@ -353,57 +353,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	s.applyCORS(w, r, ch)
 
-	if ch.StreamMiddleware.Enabled && ch.StreamMiddleware.Script != "" {
-		headersMap := make(map[string]string)
-		for k, v := range r.Header {
-			if len(v) > 0 {
-				headersMap[strings.ToLower(k)] = v[0]
-			}
-		}
-		queryMap := make(map[string]string)
-		for k, v := range r.URL.Query() {
-			if len(v) > 0 {
-				queryMap[k] = v[0]
-			}
-		}
-
-		reqData := engine.RequestData{
-			Method:  r.Method,
-			Route:   "stream",
-			Channel: ch.ID,
-			Path:    r.URL.Path,
-			Headers: headersMap,
-			Query:   queryMap,
-			Body:    "",
-		}
-
-		timeout := 3000 * time.Millisecond
-		if ch.HTTP.TimeoutMS > 0 {
-			timeout = time.Duration(ch.HTTP.TimeoutMS) * time.Millisecond
-		}
-		mCtx, mCancel := context.WithTimeout(r.Context(), timeout)
-		defer mCancel()
-
-		res, err := s.engine.Execute(mCtx, ch.StreamMiddleware.Script, ch.StreamMiddleware.Env, reqData)
-		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "stream middleware error: "+err.Error())
-			return
-		}
-
-		if !res.Accept {
-			status := res.Status
-			if status == 0 {
-				status = http.StatusUnauthorized
-			}
-			errMsg := res.Error
-			if errMsg == "" {
-				errMsg = "unauthorized"
-			}
-			writeJSONError(w, status, errMsg)
-			return
-		}
-	} else if !s.validateStreamAuth(r, ch) {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	if ok, status, msg := s.authorizeStreamClient(r, ch, "stream"); !ok {
+		writeJSONError(w, status, msg)
 		return
 	}
 
@@ -518,17 +469,29 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	authorized := s.validateAdminAuth(r)
+	var authStatus int
+	var authErrMsg string
 	if !authorized {
 		ch, exists := s.cfg.GetChannel(channelID)
-		if exists && s.validateStreamAuth(r, ch) {
-			authorized = true
+		if exists {
+			ok, status, msg := s.authorizeStreamClient(r, ch, "ack")
+			if ok {
+				authorized = true
+			} else {
+				authStatus = status
+				authErrMsg = msg
+			}
 		}
 	}
 
 	if !authorized {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"error":"unauthorized"}`))
+		if authStatus == 0 {
+			authStatus = http.StatusUnauthorized
+		}
+		if authErrMsg == "" {
+			authErrMsg = "unauthorized"
+		}
+		writeJSONError(w, authStatus, authErrMsg)
 		return
 	}
 
@@ -589,15 +552,29 @@ func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	authorized := isAdmin
+	var authStatus int
+	var authErrMsg string
 	if !authorized {
 		ch, exists := s.cfg.GetChannel(channelID)
-		if exists && s.validateStreamAuth(r, ch) {
-			authorized = true
+		if exists {
+			ok, status, msg := s.authorizeStreamClient(r, ch, "ack-batch")
+			if ok {
+				authorized = true
+			} else {
+				authStatus = status
+				authErrMsg = msg
+			}
 		}
 	}
 
 	if !authorized {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		if authStatus == 0 {
+			authStatus = http.StatusUnauthorized
+		}
+		if authErrMsg == "" {
+			authErrMsg = "unauthorized"
+		}
+		writeJSONError(w, authStatus, authErrMsg)
 		return
 	}
 
@@ -630,14 +607,28 @@ func (s *Server) handleReplayEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	authorized := s.validateAdminAuth(r)
+	var authStatus int
+	var authErrMsg string
 	if !authorized {
 		ch, exists := s.cfg.GetChannel(evt.ChannelID)
-		if exists && s.validateStreamAuth(r, ch) {
-			authorized = true
+		if exists {
+			ok, status, msg := s.authorizeStreamClient(r, ch, "replay")
+			if ok {
+				authorized = true
+			} else {
+				authStatus = status
+				authErrMsg = msg
+			}
 		}
 	}
 	if !authorized {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		if authStatus == 0 {
+			authStatus = http.StatusUnauthorized
+		}
+		if authErrMsg == "" {
+			authErrMsg = "unauthorized"
+		}
+		writeJSONError(w, authStatus, authErrMsg)
 		return
 	}
 
@@ -705,6 +696,77 @@ func (s *Server) validateStreamAuth(r *http.Request, ch *config.ChannelConfig) b
 		return true
 	}
 	return s.validateAuthToken(r, ch.Auth.GetStreamToken())
+}
+
+func (s *Server) authorizeStreamClient(r *http.Request, ch *config.ChannelConfig, route string) (bool, int, string) {
+	if ch.StreamMiddleware.Enabled && ch.StreamMiddleware.Script != "" {
+		headersMap := make(map[string]string)
+		for k, v := range r.Header {
+			if len(v) > 0 {
+				headersMap[strings.ToLower(k)] = v[0]
+			}
+		}
+		queryMap := make(map[string]string)
+		for k, v := range r.URL.Query() {
+			if len(v) > 0 {
+				queryMap[k] = v[0]
+			}
+		}
+
+		reqData := engine.RequestData{
+			Method:  r.Method,
+			Route:   route,
+			Channel: ch.ID,
+			Path:    r.URL.Path,
+			Headers: headersMap,
+			Query:   queryMap,
+			Body:    "",
+		}
+
+		timeout := 3000 * time.Millisecond
+		if ch.HTTP.TimeoutMS > 0 {
+			timeout = time.Duration(ch.HTTP.TimeoutMS) * time.Millisecond
+		}
+		mCtx, mCancel := context.WithTimeout(r.Context(), timeout)
+		defer mCancel()
+
+		res, err := s.engine.Execute(mCtx, ch.StreamMiddleware.Script, ch.StreamMiddleware.Env, reqData)
+		if err != nil {
+			return false, http.StatusInternalServerError, "stream middleware error: " + err.Error()
+		}
+
+		if !res.Accept {
+			status := res.Status
+			if status == 0 {
+				status = http.StatusUnauthorized
+			}
+			errMsg := res.Error
+			if errMsg == "" {
+				errMsg = "unauthorized"
+			}
+			return false, status, errMsg
+		}
+		return true, http.StatusOK, ""
+	}
+
+	if !s.validateStreamAuth(r, ch) {
+		return false, http.StatusUnauthorized, "unauthorized"
+	}
+	return true, http.StatusOK, ""
+}
+
+func sanitizeHeaders(h http.Header) http.Header {
+	sanitized := make(http.Header)
+	for k, v := range h {
+		lower := strings.ToLower(k)
+		switch lower {
+		case "authorization", "proxy-authorization", "x-token", "x-admin-token", "cookie", "set-cookie":
+			continue
+		default:
+			sanitized[k] = v
+		}
+	}
+	return sanitized
 }
 
 func (s *Server) validateAdminAuth(r *http.Request) bool {
