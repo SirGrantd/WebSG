@@ -14,4 +14,4 @@ auth:
 
 middleware:
   enabled: false
-  script: "modules/signed_payload.js"
+  script: "modules/example_middleware.js"
