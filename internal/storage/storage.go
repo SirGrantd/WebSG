@@ -334,6 +334,10 @@ func (s *Storage) writerLoop() {
 }
 
 func (s *Storage) InsertEvent(ctx context.Context, channelID, eventType, headersJSON string, payload []byte) (*Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	task := &writeTask{
 		channelID:   channelID,
 		eventType:   eventType,
@@ -348,15 +352,11 @@ func (s *Storage) InsertEvent(ctx context.Context, channelID, eventType, headers
 	case s.writeChan <- task:
 	}
 
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case err := <-task.errCh:
-		if err != nil {
-			return nil, err
-		}
-		return task.resultEvt, nil
+	err := <-task.errCh
+	if err != nil {
+		return nil, err
 	}
+	return task.resultEvt, nil
 }
 
 type ChannelRecord struct {

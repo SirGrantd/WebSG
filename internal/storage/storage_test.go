@@ -566,3 +566,46 @@ func TestStorage_BatchAck_PendingReplay_Filters_And_Stats(t *testing.T) {
 		t.Errorf("expected DBSizeBytes > 0, got %d", stats.DBSizeBytes)
 	}
 }
+
+func TestStorage_InsertEvent_ContextResilience(t *testing.T) {
+	dbPath := "test_ctx_resilience.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-wal")
+	defer os.Remove(dbPath + "-shm")
+
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to initialize storage: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.SyncChannels([]ChannelRecord{{ID: "chan_ctx", Name: "Context Channel"}}); err != nil {
+		t.Fatalf("failed to sync channel: %v", err)
+	}
+
+	// 1. Context already canceled before enqueue -> must fail immediately
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = s.InsertEvent(canceledCtx, "chan_ctx", "webhook", `{}`, []byte(`{"a":1}`))
+	if err == nil || !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("expected context canceled error for pre-canceled context, got: %v", err)
+	}
+
+	// 2. Active context that cancels immediately after enqueue -> must persist and return event
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer shortCancel()
+
+	evt, err := s.InsertEvent(shortCtx, "chan_ctx", "webhook", `{}`, []byte(`{"persisted":true}`))
+	if err != nil {
+		t.Fatalf("expected successful insert even with expiring caller context, got: %v", err)
+	}
+	if evt == nil || evt.ID == "" {
+		t.Fatalf("expected valid persisted event, got nil/empty")
+	}
+
+	// Verify it exists in SQLite
+	stored, err := s.GetEventByID(context.Background(), evt.ID)
+	if err != nil || stored == nil {
+		t.Fatalf("event was not found in SQLite: %v", err)
+	}
+}

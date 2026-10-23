@@ -205,7 +205,12 @@ func (c *Config) ReloadChannels() error {
 			continue
 		}
 
-		expandedData := os.ExpandEnv(string(data))
+		expandedData := os.Expand(string(data), func(key string) string {
+			if key == "id" {
+				return "${id}"
+			}
+			return os.Getenv(key)
+		})
 
 		var ch ChannelConfig
 		if err := yaml.Unmarshal([]byte(expandedData), &ch); err != nil {

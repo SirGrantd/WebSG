@@ -42,6 +42,7 @@ name: "Test Channel"
 http:
   allowed_methods: ["POST"]
   success_status: 200
+  success_body: '{"status":"ok","id":"${id}"}'
   max_body_size: "15MB"
 auth:
   type: "token"
@@ -68,6 +69,10 @@ auth:
 
 	if ch.Auth.Token != "super_secret_token_123" {
 		t.Errorf("expected token expanded to super_secret_token_123, got %s", ch.Auth.Token)
+	}
+
+	if ch.HTTP.SuccessBody != `{"status":"ok","id":"${id}"}` {
+		t.Errorf("expected success_body to preserve ${id} placeholder, got %s", ch.HTTP.SuccessBody)
 	}
 
 	if ch.MaxBodyBytes() != 15*1024*1024 {
