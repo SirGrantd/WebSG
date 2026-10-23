@@ -1364,3 +1364,65 @@ function handle(req, env) {
 		t.Errorf("expected 200 OK for authenticated replay, got %d: %s", replayRec2.Code, replayRec2.Body.String())
 	}
 }
+
+func TestAdminAuth_RejectsQueryStringToken(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// 1. GET /v1/channels with ?admin_token=... must be rejected with 401
+	rec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/v1/channels?admin_token=test_admin_token", nil))
+	if rec1.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for /v1/channels with query string admin token, got %d", rec1.Code)
+	}
+
+	// 2. GET /v1/stats with ?admin_token=... must be rejected with 401
+	rec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/v1/stats?admin_token=test_admin_token", nil))
+	if rec2.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for /v1/stats with query string admin token, got %d", rec2.Code)
+	}
+
+	// 3. GET /v1/events with ?admin_token=... must be rejected with 401
+	rec3 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/v1/events?admin_token=test_admin_token", nil))
+	if rec3.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for /v1/events with query string admin token, got %d", rec3.Code)
+	}
+
+	// 4. Header X-Admin-Token must succeed
+	rec4 := httptest.NewRecorder()
+	validReq := httptest.NewRequest(http.MethodGet, "/v1/channels", nil)
+	validReq.Header.Set("X-Admin-Token", "test_admin_token")
+	srv.Routes().ServeHTTP(rec4, validReq)
+	if rec4.Code != http.StatusOK {
+		t.Errorf("expected 200 OK with X-Admin-Token header, got %d", rec4.Code)
+	}
+}
+
+func TestAckBatch_EnforcesMaxBatchSize(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Generate 501 IDs
+	tooManyIDs := make([]string, 501)
+	for i := 0; i < 501; i++ {
+		tooManyIDs[i] = fmt.Sprintf("id_%d", i)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"channel": "test_open",
+		"ids":     tooManyIDs,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/events/ack-batch", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for batch size > 500, got %d. Body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "maximum allowed batch size of 500") {
+		t.Errorf("expected error message to mention 500 max batch size, got: %s", rec.Body.String())
+	}
+}

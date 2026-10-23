@@ -528,6 +528,11 @@ func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "ids list is required")
 		return
 	}
+	const maxAckBatchSize = 500
+	if len(reqBody.IDs) > maxAckBatchSize {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("ids list exceeds maximum allowed batch size of %d", maxAckBatchSize))
+		return
+	}
 
 	channelID := reqBody.Channel
 	if channelID == "" {
@@ -785,10 +790,6 @@ func (s *Server) validateAdminAuth(r *http.Request) bool {
 		if secureCompare(token, adminToken) {
 			return true
 		}
-	}
-
-	if secureCompare(r.URL.Query().Get("admin_token"), adminToken) {
-		return true
 	}
 
 	return false
