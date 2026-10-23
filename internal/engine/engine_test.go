@@ -226,6 +226,7 @@ function handle(req, env) {
 	}
 
 	eng := New(tmpDir)
+	eng.SetAllowPrivateNet(true)
 	env := map[string]string{"BASE_URL": mockERP.URL}
 
 	// 1. Test Valid Token
@@ -273,5 +274,235 @@ function handle(req, env) {
 	}
 	if !res4.Accept {
 		t.Errorf("expected accept for http.fetch, got false")
+	}
+}
+
+func TestEngine_ExecutionTimeout_InfiniteLoop(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptContent := `
+function handle(req, env) {
+    while (true) {} // Infinite loop to simulate CPU DoS
+    return { accept: true };
+}
+`
+	scriptPath := filepath.Join(tmpDir, "infinite_loop.js")
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0644); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+
+	eng := New(tmpDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := eng.Execute(ctx, scriptPath, nil, RequestData{})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error for infinite loop with timeout, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "timeout") {
+		t.Errorf("expected error message to mention timeout, got %q", err.Error())
+	}
+
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("execution took too long to abort: %v", elapsed)
+	}
+}
+
+func TestEngine_PKCS7Unpad_InvalidPadding(t *testing.T) {
+	// Block size 16
+	// 1. Invalid padding value > block size (e.g. 17)
+	data1 := append(bytes.Repeat([]byte("A"), 15), 17)
+	_, err1 := pkcs7Unpad(data1, 16)
+	if err1 == nil {
+		t.Errorf("expected error for padding > blockSize, got nil")
+	}
+
+	// 2. Padding value 0
+	data2 := append(bytes.Repeat([]byte("A"), 15), 0)
+	_, err2 := pkcs7Unpad(data2, 16)
+	if err2 == nil {
+		t.Errorf("expected error for padding == 0, got nil")
+	}
+
+	// 3. Inconsistent padding bytes
+	data3 := append(bytes.Repeat([]byte("A"), 13), 3, 3, 2)
+	_, err3 := pkcs7Unpad(data3, 16)
+	if err3 == nil {
+		t.Errorf("expected error for inconsistent padding bytes, got nil")
+	}
+
+	// 4. Valid padding (3 bytes of 0x03)
+	data4 := append(bytes.Repeat([]byte("A"), 13), 3, 3, 3)
+	unpadded, err4 := pkcs7Unpad(data4, 16)
+	if err4 != nil {
+		t.Fatalf("unexpected error for valid padding: %v", err4)
+	}
+	if string(unpadded) != string(bytes.Repeat([]byte("A"), 13)) {
+		t.Errorf("expected unpadded data %s, got %s", bytes.Repeat([]byte("A"), 13), unpadded)
+	}
+}
+
+func TestEngine_AntiSSRF_BlocksPrivateIPs(t *testing.T) {
+	localSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"secret":"internal"}`))
+	}))
+	defer localSrv.Close()
+
+	tmpDir := t.TempDir()
+	scriptContent := `
+function handle(req, env) {
+    var res = http.fetch(req.query.target_url, { method: "GET", timeout: 1000 });
+    if (!res.ok) {
+        return { accept: false, status: 403, error: res.error };
+    }
+    return { accept: true, body: res.body };
+}
+`
+	scriptPath := filepath.Join(tmpDir, "ssrf.js")
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0644); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+
+	// Default Engine has allowPrivateNet = false
+	eng := New(tmpDir)
+
+	// 1. Loopback address (127.0.0.1) must be blocked by SSRF protection
+	resLoopback, err := eng.Execute(context.Background(), scriptPath, nil, RequestData{
+		Query: map[string]string{"target_url": localSrv.URL},
+	})
+	if err != nil {
+		t.Fatalf("unexpected execution error: %v", err)
+	}
+	if resLoopback.Accept {
+		t.Fatal("expected SSRF protection to block loopback request, but it was accepted")
+	}
+	if !strings.Contains(resLoopback.Error, "ssrf protection") {
+		t.Errorf("expected error to mention 'ssrf protection', got: %s", resLoopback.Error)
+	}
+
+	// 2. Cloud metadata link-local address (169.254.169.254) must be blocked
+	resMeta, err := eng.Execute(context.Background(), scriptPath, nil, RequestData{
+		Query: map[string]string{"target_url": "http://169.254.169.254/latest/meta-data/"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected execution error: %v", err)
+	}
+	if resMeta.Accept || !strings.Contains(resMeta.Error, "ssrf protection") {
+		t.Errorf("expected cloud metadata IP to be blocked by SSRF protection, got: %+v", resMeta)
+	}
+}
+
+func TestEngine_PayloadMutationAndClearCache(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptPath := filepath.Join(tmpDir, "mutate.js")
+
+	scriptV1 := `
+function handle(req, env) {
+    var parsed = JSON.parse(req.body);
+    parsed.decrypted = true;
+    parsed.version = 1;
+    return {
+        accept: true,
+        body: JSON.stringify(parsed),
+        event_type: "payment.decrypted.v1"
+    };
+}
+`
+	if err := os.WriteFile(scriptPath, []byte(scriptV1), 0644); err != nil {
+		t.Fatalf("failed to write script v1: %v", err)
+	}
+
+	eng := New(tmpDir)
+	res1, err := eng.Execute(context.Background(), scriptPath, nil, RequestData{
+		Body: `{"amount":100}`,
+	})
+	if err != nil {
+		t.Fatalf("execute v1 failed: %v", err)
+	}
+	if !res1.Accept || !res1.HasBody || res1.EventType != "payment.decrypted.v1" {
+		t.Fatalf("unexpected result v1: %+v", res1)
+	}
+	if !strings.Contains(res1.Body, `"version":1`) {
+		t.Errorf("expected mutated body with version 1, got %s", res1.Body)
+	}
+
+	// Update script on disk and ClearCache for hot-reload
+	scriptV2 := `
+function handle(req, env) {
+    return {
+        accept: true,
+        body: '{"version":2}',
+        event_type: "payment.decrypted.v2"
+    };
+}
+`
+	if err := os.WriteFile(scriptPath, []byte(scriptV2), 0644); err != nil {
+		t.Fatalf("failed to write script v2: %v", err)
+	}
+
+	eng.ClearCache()
+
+	res2, err := eng.Execute(context.Background(), scriptPath, nil, RequestData{
+		Body: `{"amount":100}`,
+	})
+	if err != nil {
+		t.Fatalf("execute v2 failed: %v", err)
+	}
+	if res2.EventType != "payment.decrypted.v2" || res2.Body != `{"version":2}` {
+		t.Errorf("expected hot-reloaded script v2 output, got %+v", res2)
+	}
+}
+
+func TestEngine_GlobalScopeIsolationBetweenExecutions(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	script1Path := filepath.Join(tmpDir, "script1.js")
+	script1Content := `
+var leakedGlobal = "secret_customer_token_999";
+globalThis.anotherLeak = 12345;
+function handle(req, env) {
+    return { accept: true };
+}
+`
+	if err := os.WriteFile(script1Path, []byte(script1Content), 0644); err != nil {
+		t.Fatalf("failed to write script1: %v", err)
+	}
+
+	script2Path := filepath.Join(tmpDir, "script2.js")
+	script2Content := `
+function handle(req, env) {
+    var hasLeak1 = (typeof leakedGlobal !== "undefined");
+    var hasLeak2 = (typeof globalThis.anotherLeak !== "undefined");
+    if (hasLeak1 || hasLeak2) {
+        return { accept: false, status: 500, error: "Global variable leakage detected" };
+    }
+    return { accept: true };
+}
+`
+	if err := os.WriteFile(script2Path, []byte(script2Content), 0644); err != nil {
+		t.Fatalf("failed to write script2: %v", err)
+	}
+
+	eng := New(tmpDir)
+
+	res1, err := eng.Execute(context.Background(), script1Path, nil, RequestData{})
+	if err != nil {
+		t.Fatalf("script1 failed: %v", err)
+	}
+	if !res1.Accept {
+		t.Fatalf("script1 expected accept: true")
+	}
+
+	res2, err := eng.Execute(context.Background(), script2Path, nil, RequestData{})
+	if err != nil {
+		t.Fatalf("script2 failed: %v", err)
+	}
+	if !res2.Accept {
+		t.Errorf("security failure: %s (globals leaked across script executions in sync.Pool)", res2.Error)
 	}
 }

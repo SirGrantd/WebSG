@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,14 +30,9 @@ func main() {
 	}
 	defer store.Close()
 
-	var records []storage.ChannelRecord
 	var channelIDs []string
-	for id, ch := range cfg.Channels {
-		records = append(records, storage.ChannelRecord{ID: ch.ID, Name: ch.Name})
+	for id := range cfg.Channels {
 		channelIDs = append(channelIDs, id)
-	}
-	if err := store.SyncChannels(records); err != nil {
-		log.Printf("[WebSG] Warning: failed to sync channels to database: %v", err)
 	}
 
 	jsEngine := engine.New(cfg.ModulesDir)
@@ -54,15 +50,44 @@ func main() {
 		Handler:           server.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		BaseContext: func(l net.Listener) context.Context {
+			return rootCtx
+		},
 	}
 
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
+	reloadChan := make(chan os.Signal, 1)
+	signal.Notify(reloadChan, syscall.SIGHUP)
+
+	go func() {
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case <-reloadChan:
+				count, err := server.Reload()
+				if err != nil {
+					log.Printf("[WebSG] Hot-reload failed on SIGHUP: %v", err)
+				} else {
+					log.Printf("[WebSG] Hot-reload completed via SIGHUP (%d channel(s) active)", count)
+				}
+			}
+		}
+	}()
+
 	go func() {
 		log.Printf("[WebSG] Storage initialized (SQLite WAL: %s)", cfg.DatabasePath)
 		log.Printf("[WebSG] Loaded %d channel(s): %v", len(channelIDs), channelIDs)
 		log.Printf("[WebSG] Housekeeper active (interval: %v, acked retention: %v, TTL: %v)", cfg.HousekeepingInterval, cfg.AckedRetention, cfg.UnackedRetention)
+		if cfg.IsDefaultAdminToken {
+			if cfg.AdminToken == "websg_admin_dev" {
+				log.Println("[WebSG] SECURITY WARNING: Using default dev admin token ('websg_admin_dev'). Set WEBSG_ADMIN_TOKEN in production environment!")
+			} else {
+				log.Printf("[WebSG] SECURITY NOTICE: Generated random admin token for this session: %s", cfg.AdminToken)
+			}
+		}
 		log.Printf("[WebSG] Server listening on :%s (Headless Mode)", cfg.Port)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http server error: %v", err)
@@ -72,6 +97,7 @@ func main() {
 	<-stopChan
 	log.Println("Shutting down WebSG server gracefully...")
 	rootCancel()
+	sseBroker.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

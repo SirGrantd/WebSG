@@ -42,6 +42,7 @@ name: "Test Channel"
 http:
   allowed_methods: ["POST"]
   success_status: 200
+  success_body: '{"status":"ok","id":"${id}"}'
   max_body_size: "15MB"
 auth:
   type: "token"
@@ -70,7 +71,97 @@ auth:
 		t.Errorf("expected token expanded to super_secret_token_123, got %s", ch.Auth.Token)
 	}
 
+	if ch.HTTP.SuccessBody != `{"status":"ok","id":"${id}"}` {
+		t.Errorf("expected success_body to preserve ${id} placeholder, got %s", ch.HTTP.SuccessBody)
+	}
+
 	if ch.MaxBodyBytes() != 15*1024*1024 {
 		t.Errorf("expected 15MB in bytes, got %d", ch.MaxBodyBytes())
+	}
+}
+
+func TestConfig_ReloadChannels_InvalidYAML(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	invalidYAML := `
+id: broken_chan
+name: "Broken Channel
+http:
+  allowed_methods: [
+`
+	err := os.WriteFile(filepath.Join(tmpDir, "broken.yaml"), []byte(invalidYAML), 0644)
+	if err != nil {
+		t.Fatalf("failed to write invalid channel file: %v", err)
+	}
+
+	cfg := &Config{
+		ChannelsDir: tmpDir,
+		Channels:    make(map[string]*ChannelConfig),
+	}
+
+	// Should not fail or crash, but skip the broken file and log a warning
+	if err := cfg.ReloadChannels(); err != nil {
+		t.Fatalf("ReloadChannels returned unexpected error: %v", err)
+	}
+
+	if _, exists := cfg.GetChannel("broken_chan"); exists {
+		t.Errorf("expected broken channel to not be registered")
+	}
+}
+
+func TestAuthConfig_TokenSegregation(t *testing.T) {
+	// Case 1: Legacy token only
+	legacy := AuthConfig{
+		Type:  "token",
+		Token: "shared_secret",
+	}
+	if legacy.GetIngestToken() != "shared_secret" {
+		t.Errorf("expected GetIngestToken() = 'shared_secret', got %q", legacy.GetIngestToken())
+	}
+	if legacy.GetStreamToken() != "shared_secret" {
+		t.Errorf("expected GetStreamToken() = 'shared_secret', got %q", legacy.GetStreamToken())
+	}
+
+	// Case 2: Segregated tokens
+	segregated := AuthConfig{
+		Type:        "token",
+		Token:       "legacy_secret",
+		IngestToken: "ingest_secret",
+		StreamToken: "stream_secret",
+	}
+	if segregated.GetIngestToken() != "ingest_secret" {
+		t.Errorf("expected GetIngestToken() = 'ingest_secret', got %q", segregated.GetIngestToken())
+	}
+	if segregated.GetStreamToken() != "stream_secret" {
+		t.Errorf("expected GetStreamToken() = 'stream_secret', got %q", segregated.GetStreamToken())
+	}
+
+	// Case 3: ClientToken alias for StreamToken
+	alias := AuthConfig{
+		Type:        "token",
+		IngestToken: "ingest_secret",
+		ClientToken: "client_secret",
+	}
+	if alias.GetIngestToken() != "ingest_secret" {
+		t.Errorf("expected GetIngestToken() = 'ingest_secret', got %q", alias.GetIngestToken())
+	}
+	if alias.GetStreamToken() != "client_secret" {
+		t.Errorf("expected GetStreamToken() = 'client_secret', got %q", alias.GetStreamToken())
+	}
+}
+
+func TestConfig_ProductionAdminTokenGeneration(t *testing.T) {
+	t.Setenv("WEBSG_ENV", "production")
+	t.Setenv("WEBSG_ADMIN_TOKEN", "")
+
+	cfg := Load()
+	if !cfg.IsDefaultAdminToken {
+		t.Errorf("expected IsDefaultAdminToken to be true")
+	}
+	if cfg.AdminToken == "websg_admin_dev" {
+		t.Errorf("security failure: production environment used websg_admin_dev")
+	}
+	if len(cfg.AdminToken) != 32 {
+		t.Errorf("expected 32-char hex admin token in production, got %q (len %d)", cfg.AdminToken, len(cfg.AdminToken))
 	}
 }

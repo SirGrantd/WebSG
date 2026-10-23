@@ -4,6 +4,9 @@
 package api
 
 import (
+	"bytes"
+	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -20,19 +23,55 @@ import (
 )
 
 type Server struct {
-	cfg     *config.Config
-	storage *storage.Storage
-	engine  *engine.Engine
-	sse     *sse.Broker
+	cfg       *config.Config
+	storage   *storage.Storage
+	engine    *engine.Engine
+	sse       *sse.Broker
+	startedAt time.Time
 }
 
 func NewServer(cfg *config.Config, store *storage.Storage, eng *engine.Engine, broker *sse.Broker) *Server {
-	return &Server{
-		cfg:     cfg,
-		storage: store,
-		engine:  eng,
-		sse:     broker,
+	if cfg != nil && store != nil {
+		if cfg.EncryptionKey != "" {
+			_ = store.SetEncryptionKey(cfg.EncryptionKey)
+		}
+		var records []storage.ChannelRecord
+		for _, ch := range cfg.Channels {
+			records = append(records, storage.ChannelRecord{ID: ch.ID, Name: ch.Name})
+		}
+		_ = store.SyncChannels(records)
 	}
+	if cfg != nil && eng != nil && cfg.AllowPrivateNet {
+		eng.SetAllowPrivateNet(true)
+	}
+
+	return &Server{
+		cfg:       cfg,
+		storage:   store,
+		engine:    eng,
+		sse:       broker,
+		startedAt: time.Now(),
+	}
+}
+
+func (s *Server) Reload() (int, error) {
+	if err := s.cfg.ReloadChannels(); err != nil {
+		return 0, err
+	}
+	channels := s.cfg.ListChannels()
+	if s.storage != nil {
+		records := make([]storage.ChannelRecord, 0, len(channels))
+		for _, ch := range channels {
+			records = append(records, storage.ChannelRecord{ID: ch.ID, Name: ch.Name})
+		}
+		if err := s.storage.SyncChannels(records); err != nil {
+			return len(channels), err
+		}
+	}
+	if s.engine != nil {
+		s.engine.ClearCache()
+	}
+	return len(channels), nil
 }
 
 func (s *Server) Routes() http.Handler {
@@ -41,9 +80,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /v1/channels", s.handleListChannels)
 	mux.HandleFunc("GET /v1/events", s.handleListEvents)
+	mux.HandleFunc("GET /v1/stats", s.handleStats)
+	mux.HandleFunc("POST /v1/admin/reload", s.handleReload)
 	mux.HandleFunc("GET /v1/stream", s.handleStream)
 	mux.HandleFunc("OPTIONS /v1/stream", s.handleStreamOptions)
+	mux.HandleFunc("POST /v1/events/ack-batch", s.handleAckBatch)
 	mux.HandleFunc("POST /v1/events/{id}/ack", s.handleAck)
+	mux.HandleFunc("POST /v1/events/{id}/replay", s.handleReplayEvent)
 	mux.HandleFunc("/v1/ingest/{channel}", s.handleIngest)
 
 	return mux
@@ -51,6 +94,13 @@ func (s *Server) Routes() http.Handler {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if s.storage != nil {
+		if err := s.storage.Ping(r.Context()); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"status":"degraded","error":"database unreachable"}`))
+			return
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"ok"}`))
 }
@@ -73,8 +123,8 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	channelID := r.URL.Query().Get("channel")
-	limitStr := r.URL.Query().Get("limit")
+	q := r.URL.Query()
+	limitStr := q.Get("limit")
 	limit := 50
 	if limitStr != "" {
 		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 {
@@ -82,7 +132,16 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	events, err := s.storage.ListEvents(r.Context(), channelID, limit)
+	filter := storage.EventFilter{
+		ChannelID: q.Get("channel"),
+		Status:    q.Get("status"),
+		EventType: q.Get("event_type"),
+		AfterID:   q.Get("after_id"),
+		BeforeID:  q.Get("before_id"),
+		Limit:     limit,
+	}
+
+	events, err := s.storage.ListEventsFiltered(r.Context(), filter)
 	if err != nil {
 		http.Error(w, `{"error":"failed to fetch events"}`, http.StatusInternalServerError)
 		return
@@ -95,6 +154,55 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(events)
+}
+
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	if !s.validateAdminAuth(r) {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	stStats, err := s.storage.GetStats(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to retrieve storage stats")
+		return
+	}
+
+	subCounts := map[string]int{}
+	if s.sse != nil {
+		subCounts = s.sse.SubscriberCounts()
+	}
+
+	resp := map[string]any{
+		"uptime_seconds":     int64(time.Since(s.startedAt).Seconds()),
+		"active_subscribers": subCounts,
+		"pending_events":     stStats.PendingEvents,
+		"acked_events":       stStats.AckedEvents,
+		"total_events":       stStats.TotalEvents,
+		"db_size_bytes":      stStats.DBSizeBytes,
+		"wal_size_bytes":     stStats.WALSizeBytes,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
+	if !s.validateAdminAuth(r) {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	count, err := s.Reload()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "reload failed: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"reloaded","channels_count":%d}`, count)
 }
 
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
@@ -115,7 +223,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.validateAuth(r, ch) {
+	if !s.validateIngestAuth(r, ch) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
@@ -132,7 +240,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	headersJSON, err := json.Marshal(r.Header)
+	headersJSON, err := json.Marshal(sanitizeHeaders(r.Header))
 	if err != nil {
 		headersJSON = []byte("{}")
 	}
@@ -140,11 +248,18 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	eventType := r.URL.Query().Get("event_type")
 	if eventType == "" {
 		eventType = "webhook"
+	} else if !isValidEventType(eventType) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write(fmt.Appendf(nil, `{"error":"invalid event_type: only alphanumeric, underscore, hyphen and dot are allowed"}`))
+		return
 	}
 
 	if ch.Middleware.Enabled && ch.Middleware.Script != "" {
 		reqData := engine.RequestData{
 			Method:  r.Method,
+			Route:   "ingest",
+			Channel: ch.ID,
 			Path:    r.URL.Path,
 			Headers: make(map[string]string),
 			Query:   make(map[string]string),
@@ -152,7 +267,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		}
 		for k, v := range r.Header {
 			if len(v) > 0 {
-				reqData.Headers[k] = v[0]
+				reqData.Headers[strings.ToLower(k)] = v[0]
 			}
 		}
 		for k, v := range r.URL.Query() {
@@ -161,9 +276,16 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		res, err := s.engine.Execute(r.Context(), ch.Middleware.Script, ch.Middleware.Env, reqData)
+		timeout := 3000 * time.Millisecond
+		if ch.HTTP.TimeoutMS > 0 {
+			timeout = time.Duration(ch.HTTP.TimeoutMS) * time.Millisecond
+		}
+		mCtx, mCancel := context.WithTimeout(r.Context(), timeout)
+		defer mCancel()
+
+		res, err := s.engine.Execute(mCtx, ch.Middleware.Script, ch.Middleware.Env, reqData)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"middleware error: %s"}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "middleware error: "+err.Error())
 			return
 		}
 
@@ -176,10 +298,19 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			if errMsg == "" {
 				errMsg = "rejected by middleware"
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(status)
-			w.Write([]byte(fmt.Sprintf(`{"error":%q}`, errMsg)))
+			writeJSONError(w, status, errMsg)
 			return
+		}
+
+		if res.HasBody {
+			payload = []byte(res.Body)
+		}
+		if res.EventType != "" {
+			if !isValidEventType(res.EventType) {
+				writeJSONError(w, http.StatusBadRequest, "invalid event_type returned by middleware")
+				return
+			}
+			eventType = res.EventType
 		}
 	}
 
@@ -222,54 +353,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	s.applyCORS(w, r, ch)
 
-	if ch.StreamMiddleware.Enabled && ch.StreamMiddleware.Script != "" {
-		headersMap := make(map[string]string)
-		for k, v := range r.Header {
-			if len(v) > 0 {
-				headersMap[strings.ToLower(k)] = v[0]
-			}
-		}
-		queryMap := make(map[string]string)
-		for k, v := range r.URL.Query() {
-			if len(v) > 0 {
-				queryMap[k] = v[0]
-			}
-		}
-
-		reqData := engine.RequestData{
-			Method:  r.Method,
-			Route:   "stream",
-			Channel: ch.ID,
-			Path:    r.URL.Path,
-			Headers: headersMap,
-			Query:   queryMap,
-			Body:    "",
-		}
-
-		res, err := s.engine.Execute(r.Context(), ch.StreamMiddleware.Script, ch.StreamMiddleware.Env, reqData)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(fmt.Sprintf(`{"error":"stream middleware error: %s"}`, err.Error())))
-			return
-		}
-
-		if !res.Accept {
-			status := res.Status
-			if status == 0 {
-				status = http.StatusUnauthorized
-			}
-			errMsg := res.Error
-			if errMsg == "" {
-				errMsg = "unauthorized"
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(status)
-			w.Write([]byte(fmt.Sprintf(`{"error":%q}`, errMsg)))
-			return
-		}
-	} else if !s.validateAuth(r, ch) {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+	if ok, status, msg := s.authorizeStreamClient(r, ch, "stream"); !ok {
+		writeJSONError(w, status, msg)
 		return
 	}
 
@@ -292,18 +377,39 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		lastEventID = r.URL.Query().Get("last_event_id")
 	}
 
-	if lastEventID != "" {
-		missedEvents, err := s.storage.GetEventsAfter(r.Context(), ch.ID, lastEventID, 100)
-		if err == nil {
-			for _, evt := range missedEvents {
-				fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", evt.ID, evt.EventType, evt.Payload)
-			}
-			flusher.Flush()
-		}
-	}
+	envelopeMode := r.URL.Query().Get("format") == "envelope" || r.URL.Query().Get("envelope") == "true"
 
 	eventChan := s.sse.Subscribe(ch.ID)
 	defer s.sse.Unsubscribe(ch.ID, eventChan)
+
+	lastDeliveredID := lastEventID
+	replayPending := r.URL.Query().Get("replay") == "pending"
+
+	if lastEventID != "" || replayPending {
+		cursor := lastEventID
+		const pageSize = 100
+		for {
+			var chunk []*storage.Event
+			var err error
+			if replayPending {
+				chunk, err = s.storage.GetPendingEventsAfter(r.Context(), ch.ID, cursor, pageSize)
+			} else {
+				chunk, err = s.storage.GetEventsAfter(r.Context(), ch.ID, cursor, pageSize)
+			}
+			if err != nil || len(chunk) == 0 {
+				break
+			}
+			for _, evt := range chunk {
+				writeSSEEvent(w, evt, envelopeMode)
+				cursor = evt.ID
+				lastDeliveredID = evt.ID
+			}
+			flusher.Flush()
+			if len(chunk) < pageSize {
+				break
+			}
+		}
+	}
 
 	fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
@@ -322,8 +428,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", evt.ID, evt.EventType, evt.Payload)
+			if lastDeliveredID != "" && evt.ID <= lastDeliveredID {
+				continue
+			}
+			writeSSEEvent(w, evt, envelopeMode)
 			flusher.Flush()
+			lastDeliveredID = evt.ID
 		}
 	}
 }
@@ -331,18 +441,207 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
-		http.Error(w, `{"error":"event id is required"}`, http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"event id is required"}`))
 		return
 	}
 
-	if err := s.storage.AckEvent(r.Context(), id); err != nil {
-		http.Error(w, `{"error":"failed to ack event"}`, http.StatusInternalServerError)
+	channelID := r.URL.Query().Get("channel")
+	if channelID == "" {
+		channelID = r.Header.Get("X-Channel")
+	}
+	if channelID == "" {
+		discoveredChan, err := s.storage.GetEventChannel(r.Context(), id)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"failed to query event"}`))
+			return
+		}
+		if discoveredChan == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":"event not found"}`))
+			return
+		}
+		channelID = discoveredChan
+	}
+
+	authorized := s.validateAdminAuth(r)
+	var authStatus int
+	var authErrMsg string
+	if !authorized {
+		ch, exists := s.cfg.GetChannel(channelID)
+		if exists {
+			ok, status, msg := s.authorizeStreamClient(r, ch, "ack")
+			if ok {
+				authorized = true
+			} else {
+				authStatus = status
+				authErrMsg = msg
+			}
+		}
+	}
+
+	if !authorized {
+		if authStatus == 0 {
+			authStatus = http.StatusUnauthorized
+		}
+		if authErrMsg == "" {
+			authErrMsg = "unauthorized"
+		}
+		writeJSONError(w, authStatus, authErrMsg)
+		return
+	}
+
+	acked, err := s.storage.AckEvent(r.Context(), id, channelID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"failed to ack event"}`))
+		return
+	}
+
+	if !acked {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"event not found"}`))
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf(`{"status":"acked","id":%q}`, id)))
+	fmt.Fprintf(w, `{"status":"acked","id":%q}`, id)
+}
+
+func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
+	var reqBody struct {
+		IDs     []string `json:"ids"`
+		Channel string   `json:"channel"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&reqBody); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON payload")
+		return
+	}
+	if len(reqBody.IDs) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "ids list is required")
+		return
+	}
+	const maxAckBatchSize = 500
+	if len(reqBody.IDs) > maxAckBatchSize {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("ids list exceeds maximum allowed batch size of %d", maxAckBatchSize))
+		return
+	}
+
+	channelID := reqBody.Channel
+	if channelID == "" {
+		channelID = r.URL.Query().Get("channel")
+	}
+	if channelID == "" {
+		channelID = r.Header.Get("X-Channel")
+	}
+
+	isAdmin := s.validateAdminAuth(r)
+	if !isAdmin && channelID == "" {
+		discoveredChan, err := s.storage.GetEventChannel(r.Context(), reqBody.IDs[0])
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to query event")
+			return
+		}
+		if discoveredChan == "" {
+			writeJSONError(w, http.StatusNotFound, "event not found")
+			return
+		}
+		channelID = discoveredChan
+	}
+
+	authorized := isAdmin
+	var authStatus int
+	var authErrMsg string
+	if !authorized {
+		ch, exists := s.cfg.GetChannel(channelID)
+		if exists {
+			ok, status, msg := s.authorizeStreamClient(r, ch, "ack-batch")
+			if ok {
+				authorized = true
+			} else {
+				authStatus = status
+				authErrMsg = msg
+			}
+		}
+	}
+
+	if !authorized {
+		if authStatus == 0 {
+			authStatus = http.StatusUnauthorized
+		}
+		if authErrMsg == "" {
+			authErrMsg = "unauthorized"
+		}
+		writeJSONError(w, authStatus, authErrMsg)
+		return
+	}
+
+	ackedCount, err := s.storage.AckEventsBatch(r.Context(), reqBody.IDs, channelID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to batch ack events")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"acked","acked_count":%d}`, ackedCount)
+}
+
+func (s *Server) handleReplayEvent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "event id is required")
+		return
+	}
+
+	evt, err := s.storage.GetEventByID(r.Context(), id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to fetch event")
+		return
+	}
+	if evt == nil {
+		writeJSONError(w, http.StatusNotFound, "event not found")
+		return
+	}
+
+	authorized := s.validateAdminAuth(r)
+	var authStatus int
+	var authErrMsg string
+	if !authorized {
+		ch, exists := s.cfg.GetChannel(evt.ChannelID)
+		if exists {
+			ok, status, msg := s.authorizeStreamClient(r, ch, "replay")
+			if ok {
+				authorized = true
+			} else {
+				authStatus = status
+				authErrMsg = msg
+			}
+		}
+	}
+	if !authorized {
+		if authStatus == 0 {
+			authStatus = http.StatusUnauthorized
+		}
+		if authErrMsg == "" {
+			authErrMsg = "unauthorized"
+		}
+		writeJSONError(w, authStatus, authErrMsg)
+		return
+	}
+
+	s.sse.Publish(evt)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"replayed","id":%q,"channel_id":%q}`, evt.ID, evt.ChannelID)
 }
 
 func isMethodAllowed(method string, allowed []string) bool {
@@ -357,30 +656,122 @@ func isMethodAllowed(method string, allowed []string) bool {
 	return false
 }
 
-func (s *Server) validateAuth(r *http.Request, ch *config.ChannelConfig) bool {
-	if ch.Auth.Type == "none" || ch.Auth.Token == "" {
+func secureCompare(a, b string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func (s *Server) validateAuthToken(r *http.Request, expectedToken string) bool {
+	if expectedToken == "" {
 		return true
 	}
 
 	queryToken := r.URL.Query().Get("token")
-	if queryToken != "" && queryToken == ch.Auth.Token {
+	if queryToken != "" && secureCompare(queryToken, expectedToken) {
 		return true
 	}
 
 	headerToken := r.Header.Get("X-Token")
-	if headerToken != "" && headerToken == ch.Auth.Token {
+	if headerToken != "" && secureCompare(headerToken, expectedToken) {
 		return true
 	}
 
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if token == ch.Auth.Token {
+		if secureCompare(token, expectedToken) {
 			return true
 		}
 	}
 
 	return false
+}
+
+func (s *Server) validateIngestAuth(r *http.Request, ch *config.ChannelConfig) bool {
+	if ch.Auth.Type == "none" {
+		return true
+	}
+	return s.validateAuthToken(r, ch.Auth.GetIngestToken())
+}
+
+func (s *Server) validateStreamAuth(r *http.Request, ch *config.ChannelConfig) bool {
+	if ch.Auth.Type == "none" {
+		return true
+	}
+	return s.validateAuthToken(r, ch.Auth.GetStreamToken())
+}
+
+func (s *Server) authorizeStreamClient(r *http.Request, ch *config.ChannelConfig, route string) (bool, int, string) {
+	if ch.StreamMiddleware.Enabled && ch.StreamMiddleware.Script != "" {
+		headersMap := make(map[string]string)
+		for k, v := range r.Header {
+			if len(v) > 0 {
+				headersMap[strings.ToLower(k)] = v[0]
+			}
+		}
+		queryMap := make(map[string]string)
+		for k, v := range r.URL.Query() {
+			if len(v) > 0 {
+				queryMap[k] = v[0]
+			}
+		}
+
+		reqData := engine.RequestData{
+			Method:  r.Method,
+			Route:   route,
+			Channel: ch.ID,
+			Path:    r.URL.Path,
+			Headers: headersMap,
+			Query:   queryMap,
+			Body:    "",
+		}
+
+		timeout := 3000 * time.Millisecond
+		if ch.HTTP.TimeoutMS > 0 {
+			timeout = time.Duration(ch.HTTP.TimeoutMS) * time.Millisecond
+		}
+		mCtx, mCancel := context.WithTimeout(r.Context(), timeout)
+		defer mCancel()
+
+		res, err := s.engine.Execute(mCtx, ch.StreamMiddleware.Script, ch.StreamMiddleware.Env, reqData)
+		if err != nil {
+			return false, http.StatusInternalServerError, "stream middleware error: " + err.Error()
+		}
+
+		if !res.Accept {
+			status := res.Status
+			if status == 0 {
+				status = http.StatusUnauthorized
+			}
+			errMsg := res.Error
+			if errMsg == "" {
+				errMsg = "unauthorized"
+			}
+			return false, status, errMsg
+		}
+		return true, http.StatusOK, ""
+	}
+
+	if !s.validateStreamAuth(r, ch) {
+		return false, http.StatusUnauthorized, "unauthorized"
+	}
+	return true, http.StatusOK, ""
+}
+
+func sanitizeHeaders(h http.Header) http.Header {
+	sanitized := make(http.Header)
+	for k, v := range h {
+		lower := strings.ToLower(k)
+		switch lower {
+		case "authorization", "proxy-authorization", "x-token", "x-admin-token", "cookie", "set-cookie":
+			continue
+		default:
+			sanitized[k] = v
+		}
+	}
+	return sanitized
 }
 
 func (s *Server) validateAdminAuth(r *http.Request) bool {
@@ -389,20 +780,16 @@ func (s *Server) validateAdminAuth(r *http.Request) bool {
 		return true
 	}
 
-	if r.Header.Get("X-Admin-Token") == adminToken {
+	if secureCompare(r.Header.Get("X-Admin-Token"), adminToken) {
 		return true
 	}
 
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if token == adminToken {
+		if secureCompare(token, adminToken) {
 			return true
 		}
-	}
-
-	if r.URL.Query().Get("admin_token") == adminToken {
-		return true
 	}
 
 	return false
@@ -421,7 +808,7 @@ func (s *Server) handleStreamOptions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request, ch *config.ChannelConfig) {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		origin = "*"
+		return
 	}
 
 	allowedOrigins := []string{"*"}
@@ -429,16 +816,102 @@ func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request, ch *config.Ch
 		allowedOrigins = ch.CORS.AllowedOrigins
 	}
 
-	allowOrigin := "*"
+	var allowOrigin string
 	for _, o := range allowedOrigins {
-		if o == "*" || o == origin {
-			allowOrigin = o
+		if o == "*" {
+			allowOrigin = "*"
+			break
+		}
+		if o == origin {
+			allowOrigin = origin
 			break
 		}
 	}
 
+	if allowOrigin == "" {
+		return
+	}
+
 	w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Last-Event-ID, Authorization, Content-Type, X-Token, X-Admin-Token")
+	if allowOrigin != "*" {
+		w.Header().Set("Vary", "Origin")
+	}
+
+	allowedMethods := "GET, POST, OPTIONS"
+	if ch != nil && len(ch.CORS.AllowedMethods) > 0 {
+		allowedMethods = strings.Join(ch.CORS.AllowedMethods, ", ")
+	}
+	w.Header().Set("Access-Control-Allow-Methods", allowedMethods)
+
+	allowedHeaders := "Last-Event-ID, Authorization, Content-Type, X-Token, X-Admin-Token"
+	if ch != nil && len(ch.CORS.AllowedHeaders) > 0 {
+		allowedHeaders = strings.Join(ch.CORS.AllowedHeaders, ", ")
+	}
+	w.Header().Set("Access-Control-Allow-Headers", allowedHeaders)
 	w.Header().Set("Access-Control-Expose-Headers", "X-Event-ID")
+}
+
+func isValidEventType(t string) bool {
+	if len(t) == 0 || len(t) > 64 {
+		return false
+	}
+	for _, r := range t {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+func writeSSEEvent(w io.Writer, evt *storage.Event, envelope bool) {
+	if envelope {
+		headers := json.RawMessage(evt.HeadersJSON)
+		if len(headers) == 0 {
+			headers = json.RawMessage("{}")
+		}
+
+		type SSEEnvelope struct {
+			ID        string          `json:"id"`
+			ChannelID string          `json:"channel_id"`
+			EventType string          `json:"event_type"`
+			CreatedAt time.Time       `json:"created_at"`
+			Headers   json.RawMessage `json:"headers"`
+			Payload   any             `json:"payload"`
+		}
+
+		var payloadVal any
+		if json.Valid(evt.Payload) {
+			payloadVal = json.RawMessage(evt.Payload)
+		} else {
+			payloadVal = string(evt.Payload)
+		}
+
+		envBytes, err := json.Marshal(SSEEnvelope{
+			ID:        evt.ID,
+			ChannelID: evt.ChannelID,
+			EventType: evt.EventType,
+			CreatedAt: evt.CreatedAt,
+			Headers:   headers,
+			Payload:   payloadVal,
+		})
+		if err == nil {
+			fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", evt.ID, evt.EventType, envBytes)
+			return
+		}
+	}
+
+	fmt.Fprintf(w, "id: %s\nevent: %s\n", evt.ID, evt.EventType)
+	normalized := bytes.ReplaceAll(evt.Payload, []byte("\r\n"), []byte("\n"))
+	lines := bytes.Split(normalized, []byte("\n"))
+	for _, line := range lines {
+		fmt.Fprintf(w, "data: %s\n", line)
+	}
+	fmt.Fprint(w, "\n")
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	b, _ := json.Marshal(map[string]string{"error": msg})
+	w.Write(b)
 }

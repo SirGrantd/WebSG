@@ -6,6 +6,9 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -417,7 +420,7 @@ function handle(req, env) {
 
 	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
 
-	// 1. Test CORS preflight (OPTIONS)
+	// 1. Test CORS preflight (OPTIONS) with allowed origin
 	optReq := httptest.NewRequest(http.MethodOptions, "/v1/stream?channel=chan_stream_mw", nil)
 	optReq.Header.Set("Origin", "https://erp.app.com")
 	optRec := httptest.NewRecorder()
@@ -428,6 +431,19 @@ function handle(req, env) {
 	}
 	if optRec.Header().Get("Access-Control-Allow-Origin") != "https://erp.app.com" {
 		t.Errorf("expected CORS origin https://erp.app.com, got %s", optRec.Header().Get("Access-Control-Allow-Origin"))
+	}
+	if optRec.Header().Get("Vary") != "Origin" {
+		t.Errorf("expected Vary: Origin header, got %s", optRec.Header().Get("Vary"))
+	}
+
+	// 1b. Test CORS preflight (OPTIONS) with unauthorized origin (should NOT emit CORS header)
+	unauthOptReq := httptest.NewRequest(http.MethodOptions, "/v1/stream?channel=chan_stream_mw", nil)
+	unauthOptReq.Header.Set("Origin", "https://evil.com")
+	unauthOptRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(unauthOptRec, unauthOptReq)
+
+	if unauthOptRec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("expected empty Access-Control-Allow-Origin for unauthorized origin, got %s", unauthOptRec.Header().Get("Access-Control-Allow-Origin"))
 	}
 
 	// 2. Test Stream Middleware Reject (Invalid Token)
@@ -459,5 +475,954 @@ function handle(req, env) {
 
 	if contentType := okRec.Header().Get("Content-Type"); contentType != "text/event-stream" {
 		t.Errorf("expected Content-Type text/event-stream, got %q", contentType)
+	}
+}
+
+func TestIngest_EventTypeValidation(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// 1. Valid event_type with alphanumeric, dots, hyphens, and underscores -> 200
+	validReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=order.created_v1-final", bytes.NewReader([]byte(`{}`)))
+	validRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(validRec, validReq)
+	if validRec.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid event_type, got %d", validRec.Code)
+	}
+
+	// 2. Malicious event_type with newline / injection characters -> 400
+	badReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=webhook%0Aid:%20fake", bytes.NewReader([]byte(`{}`)))
+	badRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for event_type with newline injection, got %d", badRec.Code)
+	}
+
+	// 3. Malicious event_type with spaces -> 400
+	spaceReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=invalid%20type", bytes.NewReader([]byte(`{}`)))
+	spaceRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(spaceRec, spaceReq)
+	if spaceRec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for event_type with spaces, got %d", spaceRec.Code)
+	}
+}
+
+func TestStream_MultilinePayload(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	multilinePayload := "{\n  \"line1\": 1,\n  \"line2\": 2\n}"
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open", bytes.NewReader([]byte(multilinePayload))))
+	evtID := rec.Header().Get("X-Event-ID")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_open", nil).WithContext(ctx)
+	streamReq.Header.Set("Last-Event-ID", "00000000000000000000000000") // forces replay from beginning
+	streamRec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(streamRec, streamReq)
+	output := streamRec.Body.String()
+
+	if !strings.Contains(output, "id: "+evtID) {
+		t.Fatalf("expected stream to contain event id %s, got:\n%s", evtID, output)
+	}
+
+	// Ensure each line of the multiline payload is properly prefixed with "data: "
+	expectedLines := []string{
+		"data: {",
+		"data:   \"line1\": 1,",
+		"data:   \"line2\": 2",
+		"data: }",
+	}
+	for _, expected := range expectedLines {
+		if !strings.Contains(output, expected) {
+			t.Errorf("expected stream to contain %q, but got:\n%s", expected, output)
+		}
+	}
+}
+
+func TestStream_EnvelopeMode(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Ingest with custom header
+	ingestReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=invoice.created", bytes.NewReader([]byte(`{"total":250.5}`)))
+	ingestReq.Header.Set("X-Custom-Signature", "sig_xyz_123")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, ingestReq)
+	evtID := rec.Header().Get("X-Event-ID")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// Request with envelope format
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_open&format=envelope", nil).WithContext(ctx)
+	streamReq.Header.Set("Last-Event-ID", "00000000000000000000000000")
+	streamRec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(streamRec, streamReq)
+	output := streamRec.Body.String()
+
+	if !strings.Contains(output, "id: "+evtID) {
+		t.Fatalf("expected stream to contain event id %s, got:\n%s", evtID, output)
+	}
+
+	// Verify envelope contains metadata
+	if !strings.Contains(output, `"event_type":"invoice.created"`) {
+		t.Errorf("expected envelope to contain event_type 'invoice.created', got:\n%s", output)
+	}
+	if !strings.Contains(output, `"created_at":`) {
+		t.Errorf("expected envelope to contain created_at timestamp, got:\n%s", output)
+	}
+	if !strings.Contains(output, "X-Custom-Signature") || !strings.Contains(output, "sig_xyz_123") {
+		t.Errorf("expected envelope to contain original headers with X-Custom-Signature, got:\n%s", output)
+	}
+}
+
+func TestStream_ReplayPaginatesOver100Events(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Ingest 125 events into open channel test_open
+	const totalEvents = 125
+	eventIDs := make([]string, totalEvents)
+	for i := 0; i < totalEvents; i++ {
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open", bytes.NewReader(fmt.Appendf(nil, `{"idx":%d}`, i))))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("ingest failed on event %d: %s", i, rec.Body.String())
+		}
+		eventIDs[i] = rec.Header().Get("X-Event-ID")
+	}
+
+	// Replay from beginning (Last-Event-ID = "00000000000000000000000000")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_open", nil).WithContext(ctx)
+	streamReq.Header.Set("Last-Event-ID", "00000000000000000000000000")
+	streamRec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(streamRec, streamReq)
+	output := streamRec.Body.String()
+
+	// Verify that BOTH event 0 and event 124 (past the old 100 limit) were delivered in replay
+	if !strings.Contains(output, eventIDs[0]) {
+		t.Errorf("expected replay to contain first event %s", eventIDs[0])
+	}
+	if !strings.Contains(output, eventIDs[100]) {
+		t.Errorf("expected replay to paginate past event 100, but missing event 100 (%s)", eventIDs[100])
+	}
+	if !strings.Contains(output, eventIDs[totalEvents-1]) {
+		t.Errorf("expected replay to contain final event %d (%s)", totalEvents-1, eventIDs[totalEvents-1])
+	}
+}
+
+func TestListChannels_SecretsNotExposed(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/channels", nil)
+	req.Header.Set("X-Admin-Token", "test_admin_token")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	// Ensure secret token for test_secure channel is NOT in the JSON response
+	if strings.Contains(body, "secret_token_abc") {
+		t.Errorf("security vulnerability: sensitive channel token leaked in /v1/channels response:\n%s", body)
+	}
+	// Ensure "token" field is omitted from auth
+	if strings.Contains(body, `"token":`) {
+		t.Errorf("expected token field to be omitted from JSON response, but found it in:\n%s", body)
+	}
+}
+
+func TestAck_AuthenticationAndValidation(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// 1. Ingest an event into protected channel test_secure (requires secret_token_abc)
+	ingestReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_secure?token=secret_token_abc", bytes.NewReader([]byte(`{"order":99}`)))
+	ingestRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ingestRec, ingestReq)
+	if ingestRec.Code != http.StatusAccepted {
+		t.Fatalf("ingest failed with status %d: %s", ingestRec.Code, ingestRec.Body.String())
+	}
+	evtID := ingestRec.Header().Get("X-Event-ID")
+	if evtID == "" {
+		t.Fatalf("expected X-Event-ID header to be present")
+	}
+
+	// 2. Ack without authentication -> 401 Unauthorized
+	unauthAck := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack", nil)
+	unauthRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(unauthRec, unauthAck)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for unauthenticated ack, got %d", unauthRec.Code)
+	}
+
+	// 3. Ack with wrong token -> 401 Unauthorized
+	wrongTokenAck := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack?token=wrong_secret", nil)
+	wrongTokenRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(wrongTokenRec, wrongTokenAck)
+	if wrongTokenRec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for wrong token ack, got %d", wrongTokenRec.Code)
+	}
+
+	// 4. Ack with correct channel token -> 200 OK
+	okTokenAck := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack", nil)
+	okTokenAck.Header.Set("Authorization", "Bearer secret_token_abc")
+	okTokenRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(okTokenRec, okTokenAck)
+	if okTokenRec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for valid bearer token ack, got %d. Body: %s", okTokenRec.Code, okTokenRec.Body.String())
+	}
+
+	// 5. Ack non-existent event with admin token -> 404 Not Found
+	notFoundAck := httptest.NewRequest(http.MethodPost, "/v1/events/nonexistent_ulid_12345/ack", nil)
+	notFoundAck.Header.Set("X-Admin-Token", "test_admin_token")
+	notFoundRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(notFoundRec, notFoundAck)
+	if notFoundRec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 Not Found for non-existent event ack, got %d", notFoundRec.Code)
+	}
+}
+
+func TestServer_GracefulShutdownWithActiveSSE(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	httpServer := &http.Server{
+		Handler: srv.Routes(),
+		BaseContext: func(l net.Listener) context.Context {
+			return rootCtx
+		},
+	}
+
+	go func() {
+		_ = httpServer.Serve(listener)
+	}()
+
+	addr := listener.Addr().String()
+
+	resp, err := http.Get("http://" + addr + "/v1/stream?channel=test_open")
+	if err != nil {
+		t.Fatalf("failed to connect to stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from stream, got %d", resp.StatusCode)
+	}
+
+	buf := make([]byte, 64)
+	n, _ := resp.Body.Read(buf)
+	if !strings.Contains(string(buf[:n]), ": connected") {
+		t.Fatalf("expected ': connected' in initial stream chunk, got %s", string(buf[:n]))
+	}
+
+	// Trigger shutdown: cancel rootCtx (just like SIGINT/SIGTERM in main.go)
+	rootCancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer shutdownCancel()
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- httpServer.Shutdown(shutdownCtx)
+	}()
+
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Errorf("Shutdown returned unexpected error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Shutdown timed out! Active SSE connection blocked server termination")
+	}
+}
+
+func TestMiddleware_HeaderCasingConsistency(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Middleware checking lowercase authorization header
+	scriptContent := `
+function handle(req, env) {
+    if (req.headers["authorization"] === "Bearer valid_ingest_token") {
+        return { accept: true };
+    }
+    return { accept: false, status: 401, error: "Missing or invalid authorization" };
+}
+`
+	scriptPath := filepath.Join(tmpDir, "check_auth.js")
+	_ = os.WriteFile(scriptPath, []byte(scriptContent), 0644)
+
+	dbPath := filepath.Join(tmpDir, "test_mw_casing.db")
+	store, _ := storage.New(dbPath)
+	defer store.Close()
+
+	cfg := &config.Config{
+		Port:        "8080",
+		ChannelsDir: "channels",
+		AdminToken:  "admin",
+		Channels: map[string]*config.ChannelConfig{
+			"chan_casing": {
+				ID:   "chan_casing",
+				Name: "Casing Channel",
+				HTTP: config.HTTPConfig{
+					AllowedMethods: []string{"POST"},
+					SuccessStatus:  200,
+				},
+				Auth: config.AuthConfig{Type: "none"},
+				Middleware: config.MiddlewareConfig{
+					Enabled: true,
+					Script:  scriptPath,
+				},
+			},
+		},
+	}
+
+	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
+
+	// Send request with standard canonical title-cased "Authorization" header
+	req := httptest.NewRequest(http.MethodPost, "/v1/ingest/chan_casing", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer valid_ingest_token")
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK with lowercase header lookup in middleware, got %d. Body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMiddleware_CorruptedJSONErrorEscaping(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Middleware returning error message with double quotes, special characters, and newlines
+	scriptContent := `
+function handle(req, env) {
+    return {
+        accept: false,
+        status: 422,
+        error: 'SyntaxError: Unexpected token "}" in {\n  "test": 123\n}'
+    };
+}
+`
+	scriptPath := filepath.Join(tmpDir, "quote_error.js")
+	_ = os.WriteFile(scriptPath, []byte(scriptContent), 0644)
+
+	dbPath := filepath.Join(tmpDir, "test_mw_err.db")
+	store, _ := storage.New(dbPath)
+	defer store.Close()
+
+	cfg := &config.Config{
+		Port:        "8080",
+		ChannelsDir: "channels",
+		AdminToken:  "admin",
+		Channels: map[string]*config.ChannelConfig{
+			"chan_err": {
+				ID:   "chan_err",
+				Name: "Error Channel",
+				HTTP: config.HTTPConfig{
+					AllowedMethods: []string{"POST"},
+					SuccessStatus:  200,
+				},
+				Auth: config.AuthConfig{Type: "none"},
+				Middleware: config.MiddlewareConfig{
+					Enabled: true,
+					Script:  scriptPath,
+				},
+			},
+		},
+	}
+
+	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/ingest/chan_err", bytes.NewReader([]byte(`{}`)))
+	rec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != 422 {
+		t.Fatalf("expected 422, got %d", rec.Code)
+	}
+
+	// Verify the body is 100% valid JSON despite quotes and newlines in the JS error message
+	var parsed map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("response body is not valid JSON (corrupted by quotes/newlines): %v. Body was:\n%s", err, rec.Body.String())
+	}
+
+	if !strings.Contains(parsed["error"], "SyntaxError: Unexpected token") {
+		t.Errorf("expected error message to be preserved in parsed JSON, got: %s", parsed["error"])
+	}
+}
+
+func TestIngestAndStream_CredentialSegregation(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	srv.cfg.Channels["test_segregated"] = &config.ChannelConfig{
+		ID:   "test_segregated",
+		Name: "Segregated Auth Channel",
+		HTTP: config.HTTPConfig{
+			AllowedMethods: []string{"POST"},
+			SuccessStatus:  http.StatusOK,
+			MaxBodySize:    "1MB",
+		},
+		Auth: config.AuthConfig{
+			Type:        "token",
+			IngestToken: "webhook_ingest_token_only",
+			StreamToken: "erp_client_stream_token_only",
+		},
+	}
+	_ = srv.storage.SyncChannels([]storage.ChannelRecord{
+		{ID: "test_segregated", Name: "Segregated Auth Channel"},
+	})
+
+	// 1. Ingest with IngestToken -> Success (200 OK)
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_segregated", bytes.NewReader([]byte(`{"data":"valid"}`)))
+	req1.Header.Set("Authorization", "Bearer webhook_ingest_token_only")
+	rec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected Ingest with IngestToken to succeed (200), got %d. Body: %s", rec1.Code, rec1.Body.String())
+	}
+	evtID := rec1.Header().Get("X-Event-ID")
+
+	// 2. Ingest with StreamToken -> Rejected (401 Unauthorized)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_segregated", bytes.NewReader([]byte(`{"data":"valid"}`)))
+	req2.Header.Set("Authorization", "Bearer erp_client_stream_token_only")
+	rec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("expected Ingest with StreamToken to be 401 Unauthorized, got %d", rec2.Code)
+	}
+
+	// 3. Stream with StreamToken -> Connects (200 OK text/event-stream)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req3 := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_segregated", nil).WithContext(ctx)
+	req3.Header.Set("Authorization", "Bearer erp_client_stream_token_only")
+	rec3 := httptest.NewRecorder()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	srv.Routes().ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("expected Stream with StreamToken to succeed (200), got %d", rec3.Code)
+	}
+
+	// 4. Stream with IngestToken -> Rejected (401 Unauthorized)
+	req4 := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_segregated", nil)
+	req4.Header.Set("Authorization", "Bearer webhook_ingest_token_only")
+	rec4 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec4, req4)
+	if rec4.Code != http.StatusUnauthorized {
+		t.Fatalf("expected Stream with IngestToken to be 401 Unauthorized, got %d", rec4.Code)
+	}
+
+	// 5. Ack with StreamToken -> Success (200 OK)
+	req5 := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack?channel=test_segregated", nil)
+	req5.Header.Set("Authorization", "Bearer erp_client_stream_token_only")
+	rec5 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec5, req5)
+	if rec5.Code != http.StatusOK {
+		t.Fatalf("expected Ack with StreamToken to succeed (200), got %d", rec5.Code)
+	}
+
+	// 6. Ack with IngestToken -> Rejected (401 Unauthorized)
+	req6 := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack?channel=test_segregated", nil)
+	req6.Header.Set("Authorization", "Bearer webhook_ingest_token_only")
+	rec6 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec6, req6)
+	if rec6.Code != http.StatusUnauthorized {
+		t.Fatalf("expected Ack with IngestToken to be 401 Unauthorized, got %d", rec6.Code)
+	}
+}
+
+func TestAckBatch_And_PendingReplayStream(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Ingest 3 events into test_secure
+	ids := make([]string, 3)
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_secure?token=secret_token_abc", bytes.NewReader(fmt.Appendf(nil, `{"n":%d}`, i+1)))
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("ingest %d failed: %d", i, rec.Code)
+		}
+		ids[i] = rec.Header().Get("X-Event-ID")
+	}
+
+	// 1. Batch ACK without auth -> 401
+	batchBody, _ := json.Marshal(map[string]any{
+		"channel": "test_secure",
+		"ids":     []string{ids[0], ids[1]},
+	})
+	unauthBatch := httptest.NewRequest(http.MethodPost, "/v1/events/ack-batch", bytes.NewReader(batchBody))
+	unauthRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(unauthRec, unauthBatch)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated ack-batch, got %d", unauthRec.Code)
+	}
+
+	// 2. Batch ACK with valid stream token -> 200 OK (acks ids[0] and ids[1])
+	authBatch := httptest.NewRequest(http.MethodPost, "/v1/events/ack-batch", bytes.NewReader(batchBody))
+	authBatch.Header.Set("Authorization", "Bearer secret_token_abc")
+	authRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(authRec, authBatch)
+	if authRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for authenticated ack-batch, got %d: %s", authRec.Code, authRec.Body.String())
+	}
+	if !strings.Contains(authRec.Body.String(), `"acked_count":2`) {
+		t.Errorf("expected acked_count=2, got %s", authRec.Body.String())
+	}
+
+	// 3. Connect to stream with ?replay=pending (without Last-Event-ID) -> must only deliver ids[2]
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_secure&replay=pending", nil).WithContext(ctx)
+	streamReq.Header.Set("Authorization", "Bearer secret_token_abc")
+	streamRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(streamRec, streamReq)
+
+	output := streamRec.Body.String()
+	if strings.Contains(output, ids[0]) || strings.Contains(output, ids[1]) {
+		t.Errorf("expected acked events (%s, %s) to NOT be replayed in replay=pending mode, got:\n%s", ids[0], ids[1], output)
+	}
+	if !strings.Contains(output, ids[2]) {
+		t.Errorf("expected pending event %s to be replayed in replay=pending mode, got:\n%s", ids[2], output)
+	}
+}
+
+func TestIngest_MiddlewarePayloadAndEventTypeMutation(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptContent := `
+function handle(req, env) {
+    var data = JSON.parse(req.body);
+    return {
+        accept: true,
+        body: JSON.stringify({ mutated: true, original_id: data.id }),
+        event_type: "invoice.mutated"
+    };
+}
+`
+	scriptPath := filepath.Join(tmpDir, "mutate_ingest.js")
+	_ = os.WriteFile(scriptPath, []byte(scriptContent), 0644)
+
+	dbPath := filepath.Join(tmpDir, "test_mutate.db")
+	store, _ := storage.New(dbPath)
+	defer store.Close()
+
+	cfg := &config.Config{
+		Port:       "8080",
+		AdminToken: "admin_token",
+		Channels: map[string]*config.ChannelConfig{
+			"chan_mutate": {
+				ID:   "chan_mutate",
+				Name: "Mutate Channel",
+				HTTP: config.HTTPConfig{
+					AllowedMethods: []string{"POST"},
+					SuccessStatus:  200,
+				},
+				Auth: config.AuthConfig{Type: "none"},
+				Middleware: config.MiddlewareConfig{
+					Enabled: true,
+					Script:  scriptPath,
+				},
+			},
+		},
+	}
+
+	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
+
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/ingest/chan_mutate?event_type=original.type", bytes.NewReader([]byte(`{"id":42}`))))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	evtID := rec.Header().Get("X-Event-ID")
+	evt, err := store.GetEventByID(context.Background(), evtID)
+	if err != nil || evt == nil {
+		t.Fatalf("failed to fetch stored event: %v", err)
+	}
+	if evt.EventType != "invoice.mutated" {
+		t.Errorf("expected mutated event_type 'invoice.mutated', got %q", evt.EventType)
+	}
+	if string(evt.Payload) != `{"mutated":true,"original_id":42}` {
+		t.Errorf("expected mutated payload, got %s", evt.Payload)
+	}
+}
+
+func TestAdminReload_HotReloadChannels(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_reload.db")
+	store, _ := storage.New(dbPath)
+	defer store.Close()
+
+	cfg := &config.Config{
+		Port:        "8080",
+		ChannelsDir: tmpDir,
+		AdminToken:  "admin_secret",
+		Channels:    make(map[string]*config.ChannelConfig),
+	}
+
+	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
+
+	// Write a new channel YAML file dynamically
+	yamlContent := `
+id: hot_chan
+name: "Hot Reloaded Channel"
+http:
+  allowed_methods: ["POST"]
+  success_status: 201
+auth:
+  type: "none"
+`
+	_ = os.WriteFile(filepath.Join(tmpDir, "hot_chan.yaml"), []byte(yamlContent), 0644)
+
+	// Trigger POST /v1/admin/reload
+	reloadReq := httptest.NewRequest(http.MethodPost, "/v1/admin/reload", nil)
+	reloadReq.Header.Set("X-Admin-Token", "admin_secret")
+	reloadRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(reloadRec, reloadReq)
+
+	if reloadRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from reload, got %d: %s", reloadRec.Code, reloadRec.Body.String())
+	}
+
+	// Verify we can immediately ingest into hot_chan (proving both config reload and SQLite FK sync)
+	ingestReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/hot_chan", bytes.NewReader([]byte(`{"hot":true}`)))
+	ingestRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ingestRec, ingestReq)
+	if ingestRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on hot-reloaded channel, got %d: %s", ingestRec.Code, ingestRec.Body.String())
+	}
+}
+
+func TestManualReplay_Stats_And_EventFilters(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Ingest 2 events with different event types
+	rec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec1, httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=pix.paid", bytes.NewReader([]byte(`{"tx":100}`))))
+	evt1ID := rec1.Header().Get("X-Event-ID")
+
+	rec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=boleto.issued", bytes.NewReader([]byte(`{"tx":200}`))))
+	evt2ID := rec2.Header().Get("X-Event-ID")
+
+	// Ack evt1
+	ackRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ackRec, httptest.NewRequest(http.MethodPost, "/v1/events/"+evt1ID+"/ack", nil))
+
+	// 1. Test GET /v1/events with filters (?status=pending&event_type=boleto.issued)
+	listReq := httptest.NewRequest(http.MethodGet, "/v1/events?channel=test_open&status=pending&event_type=boleto.issued", nil)
+	listReq.Header.Set("X-Admin-Token", "test_admin_token")
+	listRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from filtered /v1/events, got %d", listRec.Code)
+	}
+	var events []*storage.Event
+	_ = json.Unmarshal(listRec.Body.Bytes(), &events)
+	if len(events) != 1 || events[0].ID != evt2ID {
+		t.Fatalf("expected only evt2 (%s) from filtered events, got %+v", evt2ID, events)
+	}
+
+	// 2. Test Manual Replay (POST /v1/events/{id}/replay) while subscriber is listening
+	subCh := srv.sse.Subscribe("test_open")
+	defer srv.sse.Unsubscribe("test_open", subCh)
+
+	replayReq := httptest.NewRequest(http.MethodPost, "/v1/events/"+evt1ID+"/replay", nil)
+	replayReq.Header.Set("X-Admin-Token", "test_admin_token")
+	replayRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(replayRec, replayReq)
+	if replayRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from manual replay, got %d: %s", replayRec.Code, replayRec.Body.String())
+	}
+
+	select {
+	case replayed := <-subCh:
+		if replayed.ID != evt1ID {
+			t.Errorf("expected replayed event ID %s, got %s", evt1ID, replayed.ID)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for manually replayed event on SSE subscriber")
+	}
+
+	// 3. Test GET /v1/stats
+	statsReq := httptest.NewRequest(http.MethodGet, "/v1/stats", nil)
+	statsReq.Header.Set("X-Admin-Token", "test_admin_token")
+	statsRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(statsRec, statsReq)
+	if statsRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/stats, got %d", statsRec.Code)
+	}
+	if !strings.Contains(statsRec.Body.String(), `"pending_events":1`) || !strings.Contains(statsRec.Body.String(), `"acked_events":1`) {
+		t.Errorf("expected stats to report 1 pending and 1 acked event, got: %s", statsRec.Body.String())
+	}
+}
+
+func TestIngest_SanitizesSensitiveHeadersInEnvelope(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	ingestReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=order.created", bytes.NewReader([]byte(`{"total":99.9}`)))
+	ingestReq.Header.Set("Authorization", "Bearer super_secret_ingest_token")
+	ingestReq.Header.Set("Proxy-Authorization", "Basic dXNlcjpwYXNz")
+	ingestReq.Header.Set("X-Token", "header_token_secret_456")
+	ingestReq.Header.Set("X-Admin-Token", "admin_secret_leak_attempt")
+	ingestReq.Header.Set("Cookie", "session=leak_session_cookie")
+	ingestReq.Header.Set("Set-Cookie", "auth=leak_auth_cookie")
+	ingestReq.Header.Set("X-Custom-Safe-Header", "safe_meta_value_123")
+	ingestReq.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, ingestReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ingest failed with status %d: %s", rec.Code, rec.Body.String())
+	}
+	evtID := rec.Header().Get("X-Event-ID")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_open&format=envelope", nil).WithContext(ctx)
+	streamReq.Header.Set("Last-Event-ID", "00000000000000000000000000")
+	streamRec := httptest.NewRecorder()
+
+	srv.Routes().ServeHTTP(streamRec, streamReq)
+	output := streamRec.Body.String()
+
+	if !strings.Contains(output, "id: "+evtID) {
+		t.Fatalf("expected stream to contain event id %s, got:\n%s", evtID, output)
+	}
+
+	sensitiveSubstrings := []string{
+		"super_secret_ingest_token",
+		"header_token_secret_456",
+		"admin_secret_leak_attempt",
+		"leak_session_cookie",
+		"leak_auth_cookie",
+		"Basic dXNlcjpwYXNz",
+	}
+	for _, sens := range sensitiveSubstrings {
+		if strings.Contains(output, sens) {
+			t.Errorf("security vulnerability: sensitive value %q leaked in envelope output:\n%s", sens, output)
+		}
+	}
+
+	if !strings.Contains(output, "safe_meta_value_123") {
+		t.Errorf("expected safe header 'safe_meta_value_123' to be preserved in envelope, got:\n%s", output)
+	}
+}
+
+func TestStreamMiddleware_EnforcedOnAckAndReplay(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptContent := `
+function handle(req, env) {
+    var token = req.query.token;
+    if (!token && req.headers["authorization"]) {
+        if (req.headers["authorization"].indexOf("Bearer ") === 0) {
+            token = req.headers["authorization"].substring(7);
+        }
+    }
+    if (token === "valid_erp_stream_jwt") {
+        return { accept: true };
+    }
+    return { accept: false, status: 401, error: "Access denied by stream middleware" };
+}
+`
+	scriptPath := filepath.Join(tmpDir, "unified_stream_mw.js")
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0644); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+
+	dbPath := filepath.Join(tmpDir, "test_unified_mw.db")
+	store, err := storage.New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to init storage: %v", err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{
+		Port:        "8080",
+		ChannelsDir: tmpDir,
+		AdminToken:  "master_admin_token",
+		Channels: map[string]*config.ChannelConfig{
+			"chan_unified": {
+				ID:   "chan_unified",
+				Name: "Unified MW Channel",
+				HTTP: config.HTTPConfig{
+					AllowedMethods: []string{"POST"},
+					SuccessStatus:  200,
+				},
+				Auth: config.AuthConfig{Type: "none"},
+				StreamMiddleware: config.MiddlewareConfig{
+					Enabled: true,
+					Script:  scriptPath,
+				},
+			},
+		},
+	}
+
+	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
+
+	// 1. Ingest an event (open ingest since auth.type is none)
+	ingestRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ingestRec, httptest.NewRequest(http.MethodPost, "/v1/ingest/chan_unified", bytes.NewReader([]byte(`{"order":55}`))))
+	if ingestRec.Code != http.StatusOK {
+		t.Fatalf("ingest failed: %d", ingestRec.Code)
+	}
+	evtID := ingestRec.Header().Get("X-Event-ID")
+
+	// 2. Unauthenticated Stream -> 401
+	streamRec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(streamRec1, httptest.NewRequest(http.MethodGet, "/v1/stream?channel=chan_unified", nil))
+	if streamRec1.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated stream, got %d", streamRec1.Code)
+	}
+
+	// 3. Unauthenticated Ack -> 401
+	ackRec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ackRec1, httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack?channel=chan_unified", nil))
+	if ackRec1.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated ack on channel with stream_middleware, got %d", ackRec1.Code)
+	}
+
+	// 4. Authenticated Ack with valid token -> 200 OK
+	ackReq2 := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/ack?channel=chan_unified", nil)
+	ackReq2.Header.Set("Authorization", "Bearer valid_erp_stream_jwt")
+	ackRec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ackRec2, ackReq2)
+	if ackRec2.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for authenticated ack, got %d. Body: %s", ackRec2.Code, ackRec2.Body.String())
+	}
+
+	// 5. Ingest second event for Batch Ack & Replay tests
+	ingestRec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ingestRec2, httptest.NewRequest(http.MethodPost, "/v1/ingest/chan_unified", bytes.NewReader([]byte(`{"order":56}`))))
+	evt2ID := ingestRec2.Header().Get("X-Event-ID")
+
+	// 6. Unauthenticated Batch Ack -> 401
+	batchBody, _ := json.Marshal(map[string]any{
+		"channel": "chan_unified",
+		"ids":     []string{evt2ID},
+	})
+	batchRec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(batchRec1, httptest.NewRequest(http.MethodPost, "/v1/events/ack-batch", bytes.NewReader(batchBody)))
+	if batchRec1.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated ack-batch on channel with stream_middleware, got %d", batchRec1.Code)
+	}
+
+	// 7. Authenticated Batch Ack -> 200 OK
+	batchReq2 := httptest.NewRequest(http.MethodPost, "/v1/events/ack-batch", bytes.NewReader(batchBody))
+	batchReq2.Header.Set("Authorization", "Bearer valid_erp_stream_jwt")
+	batchRec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(batchRec2, batchReq2)
+	if batchRec2.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for authenticated ack-batch, got %d: %s", batchRec2.Code, batchRec2.Body.String())
+	}
+
+	// 8. Unauthenticated Replay Event -> 401
+	replayRec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(replayRec1, httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/replay", nil))
+	if replayRec1.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unauthenticated replay on channel with stream_middleware, got %d", replayRec1.Code)
+	}
+
+	// 9. Authenticated Replay Event -> 200 OK
+	replayReq2 := httptest.NewRequest(http.MethodPost, "/v1/events/"+evtID+"/replay", nil)
+	replayReq2.Header.Set("Authorization", "Bearer valid_erp_stream_jwt")
+	replayRec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(replayRec2, replayReq2)
+	if replayRec2.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for authenticated replay, got %d: %s", replayRec2.Code, replayRec2.Body.String())
+	}
+}
+
+func TestAdminAuth_RejectsQueryStringToken(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// 1. GET /v1/channels with ?admin_token=... must be rejected with 401
+	rec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/v1/channels?admin_token=test_admin_token", nil))
+	if rec1.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for /v1/channels with query string admin token, got %d", rec1.Code)
+	}
+
+	// 2. GET /v1/stats with ?admin_token=... must be rejected with 401
+	rec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/v1/stats?admin_token=test_admin_token", nil))
+	if rec2.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for /v1/stats with query string admin token, got %d", rec2.Code)
+	}
+
+	// 3. GET /v1/events with ?admin_token=... must be rejected with 401
+	rec3 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/v1/events?admin_token=test_admin_token", nil))
+	if rec3.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for /v1/events with query string admin token, got %d", rec3.Code)
+	}
+
+	// 4. Header X-Admin-Token must succeed
+	rec4 := httptest.NewRecorder()
+	validReq := httptest.NewRequest(http.MethodGet, "/v1/channels", nil)
+	validReq.Header.Set("X-Admin-Token", "test_admin_token")
+	srv.Routes().ServeHTTP(rec4, validReq)
+	if rec4.Code != http.StatusOK {
+		t.Errorf("expected 200 OK with X-Admin-Token header, got %d", rec4.Code)
+	}
+}
+
+func TestAckBatch_EnforcesMaxBatchSize(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Generate 501 IDs
+	tooManyIDs := make([]string, 501)
+	for i := 0; i < 501; i++ {
+		tooManyIDs[i] = fmt.Sprintf("id_%d", i)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"channel": "test_open",
+		"ids":     tooManyIDs,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/events/ack-batch", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for batch size > 500, got %d. Body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "maximum allowed batch size of 500") {
+		t.Errorf("expected error message to mention 500 max batch size, got: %s", rec.Body.String())
 	}
 }

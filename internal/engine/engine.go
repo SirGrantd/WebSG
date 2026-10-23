@@ -15,9 +15,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,22 +37,105 @@ type RequestData struct {
 }
 
 type Result struct {
-	Accept bool   `json:"accept"`
-	Status int    `json:"status"`
-	Error  string `json:"error"`
+	Accept    bool   `json:"accept"`
+	Status    int    `json:"status"`
+	Error     string `json:"error"`
+	Body      string `json:"body,omitempty"`
+	HasBody   bool   `json:"-"`
+	EventType string `json:"event_type,omitempty"`
+}
+
+type pooledVM struct {
+	vm          *goja.Runtime
+	reqCtx      context.Context
+	initialKeys map[string]bool
 }
 
 type Engine struct {
-	modulesDir string
-	mu         sync.RWMutex
-	programs   map[string]*goja.Program
+	modulesDir      string
+	mu              sync.RWMutex
+	programs        map[string]*goja.Program
+	httpClient      *http.Client
+	vmPool          sync.Pool
+	allowPrivateNet bool
 }
 
 func New(modulesDir string) *Engine {
-	return &Engine{
-		modulesDir: modulesDir,
-		programs:   make(map[string]*goja.Program),
+	allowEnv := strings.ToLower(strings.TrimSpace(os.Getenv("WEBSG_ALLOW_PRIVATE_NET")))
+	allowPrivate := allowEnv == "true" || allowEnv == "1"
+
+	eng := &Engine{
+		modulesDir:      modulesDir,
+		programs:        make(map[string]*goja.Program),
+		allowPrivateNet: allowPrivate,
 	}
+
+	dialer := &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	eng.httpClient = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 20,
+			IdleConnTimeout:     90 * time.Second,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+				if err != nil {
+					return nil, err
+				}
+				if len(ips) == 0 {
+					return nil, fmt.Errorf("no IP addresses found for host %s", host)
+				}
+				if !eng.IsPrivateNetAllowed() {
+					for _, ipAddr := range ips {
+						if isRestrictedIP(ipAddr.IP) {
+							return nil, fmt.Errorf("ssrf protection: access to private or loopback address %s is blocked", ipAddr.IP.String())
+						}
+					}
+				}
+				return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+			},
+		},
+	}
+
+	eng.vmPool.New = func() any {
+		p := &pooledVM{
+			vm:     goja.New(),
+			reqCtx: context.Background(),
+		}
+		eng.initSandbox(p)
+		return p
+	}
+
+	return eng
+}
+
+func isRestrictedIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+func (e *Engine) SetAllowPrivateNet(allow bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.allowPrivateNet = allow
+}
+
+func (e *Engine) IsPrivateNetAllowed() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.allowPrivateNet
+}
+
+func (e *Engine) ClearCache() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.programs = make(map[string]*goja.Program)
 }
 
 func (e *Engine) Execute(ctx context.Context, scriptPath string, env map[string]string, req RequestData) (*Result, error) {
@@ -67,15 +152,48 @@ func (e *Engine) Execute(ctx context.Context, scriptPath string, env map[string]
 		return nil, fmt.Errorf("failed to compile middleware script %s: %w", scriptPath, err)
 	}
 
-	vm := goja.New()
-	e.setupSandbox(vm)
+	p := e.vmPool.Get().(*pooledVM)
+	p.reqCtx = ctx
+	p.vm.ClearInterrupt()
+	_ = p.vm.Set("handle", goja.Undefined())
+	vm := p.vm
+
+	done := make(chan struct{})
+	watcherExited := make(chan struct{})
+
+	go func() {
+		defer close(watcherExited)
+		select {
+		case <-done:
+		case <-ctx.Done():
+			vm.Interrupt("execution timeout exceeded")
+		}
+	}()
+
+	defer func() {
+		close(done)
+		<-watcherExited
+		vm.ClearInterrupt()
+		p.reqCtx = context.Background()
+		for _, k := range vm.GlobalObject().Keys() {
+			if !p.initialKeys[k] {
+				_ = vm.GlobalObject().Delete(k)
+				_ = vm.Set(k, goja.Undefined())
+			}
+		}
+		_ = vm.Set("handle", goja.Undefined())
+		e.vmPool.Put(p)
+	}()
 
 	if _, err := vm.RunProgram(program); err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("middleware execution timeout: %w", ctx.Err())
+		}
 		return nil, fmt.Errorf("script execution failed: %w", err)
 	}
 
 	handleVal := vm.Get("handle")
-	if handleVal == nil {
+	if handleVal == nil || goja.IsUndefined(handleVal) {
 		return nil, fmt.Errorf("script %s does not define a handle(req, env) function", scriptPath)
 	}
 
@@ -98,6 +216,9 @@ func (e *Engine) Execute(ctx context.Context, scriptPath string, env map[string]
 
 	resVal, err := handleFn(goja.Undefined(), reqVal, envVal)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("middleware execution timeout: %w", ctx.Err())
+		}
 		return nil, fmt.Errorf("middleware function error: %w", err)
 	}
 
@@ -123,10 +244,25 @@ func (e *Engine) Execute(ctx context.Context, scriptPath string, env map[string]
 		errMsg = msgVal.String()
 	}
 
+	var mutatedBody string
+	hasBody := false
+	if bodyVal := resObj.Get("body"); bodyVal != nil && !goja.IsUndefined(bodyVal) && !goja.IsNull(bodyVal) {
+		mutatedBody = bodyVal.String()
+		hasBody = true
+	}
+
+	eventType := ""
+	if evtVal := resObj.Get("event_type"); evtVal != nil && !goja.IsUndefined(evtVal) && !goja.IsNull(evtVal) {
+		eventType = evtVal.String()
+	}
+
 	return &Result{
-		Accept: accept,
-		Status: status,
-		Error:  errMsg,
+		Accept:    accept,
+		Status:    status,
+		Error:     errMsg,
+		Body:      mutatedBody,
+		HasBody:   hasBody,
+		EventType: eventType,
 	}, nil
 }
 
@@ -159,7 +295,8 @@ func (e *Engine) getOrCompile(path string) (*goja.Program, error) {
 	return prog, nil
 }
 
-func (e *Engine) setupSandbox(vm *goja.Runtime) {
+func (e *Engine) initSandbox(p *pooledVM) {
+	vm := p.vm
 	cryptoObj := vm.NewObject()
 
 	// crypto.hmacSha256(key, data) -> hex string
@@ -277,7 +414,10 @@ func (e *Engine) setupSandbox(vm *goja.Runtime) {
 		decrypted := make([]byte, len(ciphertext))
 		mode.CryptBlocks(decrypted, ciphertext)
 
-		unpadded, _ := pkcs7Unpad(decrypted, aes.BlockSize)
+		unpadded, err := pkcs7Unpad(decrypted, aes.BlockSize)
+		if err != nil {
+			return vm.ToValue("")
+		}
 		return vm.ToValue(string(unpadded))
 	})
 
@@ -298,7 +438,11 @@ func (e *Engine) setupSandbox(vm *goja.Runtime) {
 			timeoutMs = 10000
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+		baseCtx := p.reqCtx
+		if baseCtx == nil {
+			baseCtx = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(baseCtx, time.Duration(timeoutMs)*time.Millisecond)
 		defer cancel()
 
 		var reqBody io.Reader
@@ -320,8 +464,7 @@ func (e *Engine) setupSandbox(vm *goja.Runtime) {
 			httpReq.Header.Set(k, v)
 		}
 
-		client := &http.Client{Timeout: time.Duration(timeoutMs) * time.Millisecond}
-		resp, err := client.Do(httpReq)
+		resp, err := e.httpClient.Do(httpReq)
 		if err != nil {
 			return map[string]any{
 				"status": 0,
@@ -399,6 +542,11 @@ func (e *Engine) setupSandbox(vm *goja.Runtime) {
 		return goja.Undefined()
 	})
 	vm.Set("console", consoleObj)
+
+	p.initialKeys = make(map[string]bool)
+	for _, k := range vm.GlobalObject().Keys() {
+		p.initialKeys[k] = true
+	}
 }
 
 func parseHeaders(vm *goja.Runtime, val goja.Value) map[string]string {
@@ -420,13 +568,16 @@ func pkcs7Unpad(data []byte, blockSize int) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty data")
 	}
+	if len(data)%blockSize != 0 {
+		return nil, fmt.Errorf("data length is not a multiple of blockSize")
+	}
 	padding := int(data[len(data)-1])
 	if padding == 0 || padding > blockSize || padding > len(data) {
-		return data, nil
+		return nil, fmt.Errorf("invalid padding length: %d", padding)
 	}
 	for i := len(data) - padding; i < len(data); i++ {
 		if int(data[i]) != padding {
-			return data, nil
+			return nil, fmt.Errorf("invalid padding byte at index %d", i)
 		}
 	}
 	return data[:len(data)-padding], nil
