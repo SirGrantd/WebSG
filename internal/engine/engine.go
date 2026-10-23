@@ -46,8 +46,9 @@ type Result struct {
 }
 
 type pooledVM struct {
-	vm     *goja.Runtime
-	reqCtx context.Context
+	vm          *goja.Runtime
+	reqCtx      context.Context
+	initialKeys map[string]bool
 }
 
 type Engine struct {
@@ -174,6 +175,12 @@ func (e *Engine) Execute(ctx context.Context, scriptPath string, env map[string]
 		<-watcherExited
 		vm.ClearInterrupt()
 		p.reqCtx = context.Background()
+		for _, k := range vm.GlobalObject().Keys() {
+			if !p.initialKeys[k] {
+				_ = vm.GlobalObject().Delete(k)
+				_ = vm.Set(k, goja.Undefined())
+			}
+		}
 		_ = vm.Set("handle", goja.Undefined())
 		e.vmPool.Put(p)
 	}()
@@ -535,6 +542,11 @@ func (e *Engine) initSandbox(p *pooledVM) {
 		return goja.Undefined()
 	})
 	vm.Set("console", consoleObj)
+
+	p.initialKeys = make(map[string]bool)
+	for _, k := range vm.GlobalObject().Keys() {
+		p.initialKeys[k] = true
+	}
 }
 
 func parseHeaders(vm *goja.Runtime, val goja.Value) map[string]string {

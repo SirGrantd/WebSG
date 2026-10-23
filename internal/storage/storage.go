@@ -320,14 +320,50 @@ func (s *Storage) writerLoop() {
 		if batchErr != nil {
 			_ = tx.Rollback()
 			_ = txStmt.Close()
+
+			// Fallback: retry tasks individually to isolate the failing event
 			for _, t := range tasks {
-				t.errCh <- batchErr
+				evt := t.resultEvt
+				dbPayload, encErr := s.encryptPayload(evt.Payload)
+				if encErr != nil {
+					t.errCh <- encErr
+					continue
+				}
+				_, execErr := s.insertStmt.Exec(
+					evt.ID,
+					evt.ChannelID,
+					evt.EventType,
+					evt.HeadersJSON,
+					dbPayload,
+					evt.Status,
+				)
+				t.errCh <- execErr
 			}
 		} else {
 			commitErr := tx.Commit()
 			_ = txStmt.Close()
-			for _, t := range tasks {
-				t.errCh <- commitErr
+			if commitErr != nil {
+				for _, t := range tasks {
+					evt := t.resultEvt
+					dbPayload, encErr := s.encryptPayload(evt.Payload)
+					if encErr != nil {
+						t.errCh <- encErr
+						continue
+					}
+					_, execErr := s.insertStmt.Exec(
+						evt.ID,
+						evt.ChannelID,
+						evt.EventType,
+						evt.HeadersJSON,
+						dbPayload,
+						evt.Status,
+					)
+					t.errCh <- execErr
+				}
+			} else {
+				for _, t := range tasks {
+					t.errCh <- nil
+				}
 			}
 		}
 	}

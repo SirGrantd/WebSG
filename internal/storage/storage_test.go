@@ -609,3 +609,60 @@ func TestStorage_InsertEvent_ContextResilience(t *testing.T) {
 		t.Fatalf("event was not found in SQLite: %v", err)
 	}
 }
+
+func TestStorage_GroupCommit_IsolatesIndividualFailure(t *testing.T) {
+	dbPath := "test_batch_isolation.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-wal")
+	defer os.Remove(dbPath + "-shm")
+
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to initialize storage: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.SyncChannels([]ChannelRecord{{ID: "chan_valid", Name: "Valid Channel"}}); err != nil {
+		t.Fatalf("failed to sync channel: %v", err)
+	}
+
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	var err1, err2, errInvalid error
+	var evt1, evt2 *Event
+
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		evt1, err1 = s.InsertEvent(ctx, "chan_valid", "webhook", `{}`, []byte(`{"valid":1}`))
+	}()
+	go func() {
+		defer wg.Done()
+		_, errInvalid = s.InsertEvent(ctx, "non_existent_channel", "webhook", `{}`, []byte(`{"invalid":true}`))
+	}()
+	go func() {
+		defer wg.Done()
+		evt2, err2 = s.InsertEvent(ctx, "chan_valid", "webhook", `{}`, []byte(`{"valid":2}`))
+	}()
+
+	wg.Wait()
+
+	if errInvalid == nil {
+		t.Fatal("expected error for non_existent_channel insert, got nil")
+	}
+
+	if err1 != nil {
+		t.Errorf("expected evt1 to succeed via fallback, got error: %v", err1)
+	}
+	if evt1 == nil || evt1.ID == "" {
+		t.Errorf("expected valid evt1, got nil/empty")
+	}
+
+	if err2 != nil {
+		t.Errorf("expected evt2 to succeed via fallback, got error: %v", err2)
+	}
+	if evt2 == nil || evt2.ID == "" {
+		t.Errorf("expected valid evt2, got nil/empty")
+	}
+}

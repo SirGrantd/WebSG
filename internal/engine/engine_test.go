@@ -457,3 +457,52 @@ function handle(req, env) {
 		t.Errorf("expected hot-reloaded script v2 output, got %+v", res2)
 	}
 }
+
+func TestEngine_GlobalScopeIsolationBetweenExecutions(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	script1Path := filepath.Join(tmpDir, "script1.js")
+	script1Content := `
+var leakedGlobal = "secret_customer_token_999";
+globalThis.anotherLeak = 12345;
+function handle(req, env) {
+    return { accept: true };
+}
+`
+	if err := os.WriteFile(script1Path, []byte(script1Content), 0644); err != nil {
+		t.Fatalf("failed to write script1: %v", err)
+	}
+
+	script2Path := filepath.Join(tmpDir, "script2.js")
+	script2Content := `
+function handle(req, env) {
+    var hasLeak1 = (typeof leakedGlobal !== "undefined");
+    var hasLeak2 = (typeof globalThis.anotherLeak !== "undefined");
+    if (hasLeak1 || hasLeak2) {
+        return { accept: false, status: 500, error: "Global variable leakage detected" };
+    }
+    return { accept: true };
+}
+`
+	if err := os.WriteFile(script2Path, []byte(script2Content), 0644); err != nil {
+		t.Fatalf("failed to write script2: %v", err)
+	}
+
+	eng := New(tmpDir)
+
+	res1, err := eng.Execute(context.Background(), script1Path, nil, RequestData{})
+	if err != nil {
+		t.Fatalf("script1 failed: %v", err)
+	}
+	if !res1.Accept {
+		t.Fatalf("script1 expected accept: true")
+	}
+
+	res2, err := eng.Execute(context.Background(), script2Path, nil, RequestData{})
+	if err != nil {
+		t.Fatalf("script2 failed: %v", err)
+	}
+	if !res2.Accept {
+		t.Errorf("security failure: %s (globals leaked across script executions in sync.Pool)", res2.Error)
+	}
+}
