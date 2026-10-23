@@ -81,3 +81,28 @@ func TestBroker_Close(t *testing.T) {
 	// Calling unsubscribe after close should not panic
 	broker.Unsubscribe("chan_1", ch1)
 }
+
+func TestBroker_SubscriberCounts(t *testing.T) {
+	broker := New()
+	ch1 := broker.Subscribe("chan_a")
+	ch2 := broker.Subscribe("chan_a")
+	ch3 := broker.Subscribe("chan_b")
+
+	counts := broker.SubscriberCounts()
+	if counts["chan_a"] != 2 || counts["chan_b"] != 1 {
+		t.Fatalf("expected chan_a=2 and chan_b=1, got %v", counts)
+	}
+
+	broker.Unsubscribe("chan_a", ch1)
+	counts = broker.SubscriberCounts()
+	if counts["chan_a"] != 1 {
+		t.Fatalf("expected chan_a=1 after unsubscribe, got %v", counts)
+	}
+
+	broker.Unsubscribe("chan_a", ch2)
+	broker.Unsubscribe("chan_b", ch3)
+	counts = broker.SubscriberCounts()
+	if len(counts) != 0 {
+		t.Fatalf("expected empty map after all unsubscribed, got %v", counts)
+	}
+}

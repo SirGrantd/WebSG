@@ -84,3 +84,14 @@ func (b *Broker) Publish(evt *storage.Event) {
 		}
 	}
 }
+
+func (b *Broker) SubscriberCounts() map[string]int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	counts := make(map[string]int, len(b.clients))
+	for channelID, subs := range b.clients {
+		counts[channelID] = len(subs)
+	}
+	return counts
+}

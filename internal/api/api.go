@@ -23,27 +23,55 @@ import (
 )
 
 type Server struct {
-	cfg     *config.Config
-	storage *storage.Storage
-	engine  *engine.Engine
-	sse     *sse.Broker
+	cfg       *config.Config
+	storage   *storage.Storage
+	engine    *engine.Engine
+	sse       *sse.Broker
+	startedAt time.Time
 }
 
 func NewServer(cfg *config.Config, store *storage.Storage, eng *engine.Engine, broker *sse.Broker) *Server {
 	if cfg != nil && store != nil {
+		if cfg.EncryptionKey != "" {
+			_ = store.SetEncryptionKey(cfg.EncryptionKey)
+		}
 		var records []storage.ChannelRecord
 		for _, ch := range cfg.Channels {
 			records = append(records, storage.ChannelRecord{ID: ch.ID, Name: ch.Name})
 		}
 		_ = store.SyncChannels(records)
 	}
+	if cfg != nil && eng != nil && cfg.AllowPrivateNet {
+		eng.SetAllowPrivateNet(true)
+	}
 
 	return &Server{
-		cfg:     cfg,
-		storage: store,
-		engine:  eng,
-		sse:     broker,
+		cfg:       cfg,
+		storage:   store,
+		engine:    eng,
+		sse:       broker,
+		startedAt: time.Now(),
 	}
+}
+
+func (s *Server) Reload() (int, error) {
+	if err := s.cfg.ReloadChannels(); err != nil {
+		return 0, err
+	}
+	channels := s.cfg.ListChannels()
+	if s.storage != nil {
+		records := make([]storage.ChannelRecord, 0, len(channels))
+		for _, ch := range channels {
+			records = append(records, storage.ChannelRecord{ID: ch.ID, Name: ch.Name})
+		}
+		if err := s.storage.SyncChannels(records); err != nil {
+			return len(channels), err
+		}
+	}
+	if s.engine != nil {
+		s.engine.ClearCache()
+	}
+	return len(channels), nil
 }
 
 func (s *Server) Routes() http.Handler {
@@ -52,9 +80,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /v1/channels", s.handleListChannels)
 	mux.HandleFunc("GET /v1/events", s.handleListEvents)
+	mux.HandleFunc("GET /v1/stats", s.handleStats)
+	mux.HandleFunc("POST /v1/admin/reload", s.handleReload)
 	mux.HandleFunc("GET /v1/stream", s.handleStream)
 	mux.HandleFunc("OPTIONS /v1/stream", s.handleStreamOptions)
+	mux.HandleFunc("POST /v1/events/ack-batch", s.handleAckBatch)
 	mux.HandleFunc("POST /v1/events/{id}/ack", s.handleAck)
+	mux.HandleFunc("POST /v1/events/{id}/replay", s.handleReplayEvent)
 	mux.HandleFunc("/v1/ingest/{channel}", s.handleIngest)
 
 	return mux
@@ -62,6 +94,13 @@ func (s *Server) Routes() http.Handler {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if s.storage != nil {
+		if err := s.storage.Ping(r.Context()); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"status":"degraded","error":"database unreachable"}`))
+			return
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"ok"}`))
 }
@@ -84,8 +123,8 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	channelID := r.URL.Query().Get("channel")
-	limitStr := r.URL.Query().Get("limit")
+	q := r.URL.Query()
+	limitStr := q.Get("limit")
 	limit := 50
 	if limitStr != "" {
 		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 {
@@ -93,7 +132,16 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	events, err := s.storage.ListEvents(r.Context(), channelID, limit)
+	filter := storage.EventFilter{
+		ChannelID: q.Get("channel"),
+		Status:    q.Get("status"),
+		EventType: q.Get("event_type"),
+		AfterID:   q.Get("after_id"),
+		BeforeID:  q.Get("before_id"),
+		Limit:     limit,
+	}
+
+	events, err := s.storage.ListEventsFiltered(r.Context(), filter)
 	if err != nil {
 		http.Error(w, `{"error":"failed to fetch events"}`, http.StatusInternalServerError)
 		return
@@ -106,6 +154,55 @@ func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(events)
+}
+
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	if !s.validateAdminAuth(r) {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	stStats, err := s.storage.GetStats(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to retrieve storage stats")
+		return
+	}
+
+	subCounts := map[string]int{}
+	if s.sse != nil {
+		subCounts = s.sse.SubscriberCounts()
+	}
+
+	resp := map[string]any{
+		"uptime_seconds":     int64(time.Since(s.startedAt).Seconds()),
+		"active_subscribers": subCounts,
+		"pending_events":     stStats.PendingEvents,
+		"acked_events":       stStats.AckedEvents,
+		"total_events":       stStats.TotalEvents,
+		"db_size_bytes":      stStats.DBSizeBytes,
+		"wal_size_bytes":     stStats.WALSizeBytes,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
+	if !s.validateAdminAuth(r) {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	count, err := s.Reload()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "reload failed: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"reloaded","channels_count":%d}`, count)
 }
 
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
@@ -203,6 +300,17 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			}
 			writeJSONError(w, status, errMsg)
 			return
+		}
+
+		if res.HasBody {
+			payload = []byte(res.Body)
+		}
+		if res.EventType != "" {
+			if !isValidEventType(res.EventType) {
+				writeJSONError(w, http.StatusBadRequest, "invalid event_type returned by middleware")
+				return
+			}
+			eventType = res.EventType
 		}
 	}
 
@@ -324,12 +432,19 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	defer s.sse.Unsubscribe(ch.ID, eventChan)
 
 	lastDeliveredID := lastEventID
+	replayPending := r.URL.Query().Get("replay") == "pending"
 
-	if lastEventID != "" {
+	if lastEventID != "" || replayPending {
 		cursor := lastEventID
 		const pageSize = 100
 		for {
-			chunk, err := s.storage.GetEventsAfter(r.Context(), ch.ID, cursor, pageSize)
+			var chunk []*storage.Event
+			var err error
+			if replayPending {
+				chunk, err = s.storage.GetPendingEventsAfter(r.Context(), ch.ID, cursor, pageSize)
+			} else {
+				chunk, err = s.storage.GetEventsAfter(r.Context(), ch.ID, cursor, pageSize)
+			}
 			if err != nil || len(chunk) == 0 {
 				break
 			}
@@ -437,6 +552,102 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"acked","id":%q}`, id)
 }
 
+func (s *Server) handleAckBatch(w http.ResponseWriter, r *http.Request) {
+	var reqBody struct {
+		IDs     []string `json:"ids"`
+		Channel string   `json:"channel"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&reqBody); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON payload")
+		return
+	}
+	if len(reqBody.IDs) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "ids list is required")
+		return
+	}
+
+	channelID := reqBody.Channel
+	if channelID == "" {
+		channelID = r.URL.Query().Get("channel")
+	}
+	if channelID == "" {
+		channelID = r.Header.Get("X-Channel")
+	}
+
+	isAdmin := s.validateAdminAuth(r)
+	if !isAdmin && channelID == "" {
+		discoveredChan, err := s.storage.GetEventChannel(r.Context(), reqBody.IDs[0])
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to query event")
+			return
+		}
+		if discoveredChan == "" {
+			writeJSONError(w, http.StatusNotFound, "event not found")
+			return
+		}
+		channelID = discoveredChan
+	}
+
+	authorized := isAdmin
+	if !authorized {
+		ch, exists := s.cfg.GetChannel(channelID)
+		if exists && s.validateStreamAuth(r, ch) {
+			authorized = true
+		}
+	}
+
+	if !authorized {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	ackedCount, err := s.storage.AckEventsBatch(r.Context(), reqBody.IDs, channelID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to batch ack events")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"acked","acked_count":%d}`, ackedCount)
+}
+
+func (s *Server) handleReplayEvent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "event id is required")
+		return
+	}
+
+	evt, err := s.storage.GetEventByID(r.Context(), id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to fetch event")
+		return
+	}
+	if evt == nil {
+		writeJSONError(w, http.StatusNotFound, "event not found")
+		return
+	}
+
+	authorized := s.validateAdminAuth(r)
+	if !authorized {
+		ch, exists := s.cfg.GetChannel(evt.ChannelID)
+		if exists && s.validateStreamAuth(r, ch) {
+			authorized = true
+		}
+	}
+	if !authorized {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	s.sse.Publish(evt)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"replayed","id":%q,"channel_id":%q}`, evt.ID, evt.ChannelID)
+}
+
 func isMethodAllowed(method string, allowed []string) bool {
 	if len(allowed) == 0 {
 		return method == http.MethodPost
@@ -494,13 +705,6 @@ func (s *Server) validateStreamAuth(r *http.Request, ch *config.ChannelConfig) b
 		return true
 	}
 	return s.validateAuthToken(r, ch.Auth.GetStreamToken())
-}
-
-func (s *Server) validateAuth(r *http.Request, ch *config.ChannelConfig) bool {
-	if ch.Auth.Type == "none" {
-		return true
-	}
-	return s.validateAuthToken(r, ch.Auth.Token)
 }
 
 func (s *Server) validateAdminAuth(r *http.Request) bool {

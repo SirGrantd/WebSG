@@ -1,6 +1,14 @@
 name: WebSG
 values:
   - key: port
-    value: ''
+    value: '5107'
   - key: websg_token_test
+    value: websg_admin_dev
+  - key: channel_id
+    value: default
+  - key: event_id
+    value: ''
+  - key: ingest_token
+    value: ''
+  - key: stream_token
     value: ''

@@ -63,6 +63,25 @@ func main() {
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
+	reloadChan := make(chan os.Signal, 1)
+	signal.Notify(reloadChan, syscall.SIGHUP)
+
+	go func() {
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case <-reloadChan:
+				count, err := server.Reload()
+				if err != nil {
+					log.Printf("[WebSG] Hot-reload failed on SIGHUP: %v", err)
+				} else {
+					log.Printf("[WebSG] Hot-reload completed via SIGHUP (%d channel(s) active)", count)
+				}
+			}
+		}
+	}()
+
 	go func() {
 		log.Printf("[WebSG] Storage initialized (SQLite WAL: %s)", cfg.DatabasePath)
 		log.Printf("[WebSG] Loaded %d channel(s): %v", len(channelIDs), channelIDs)

@@ -4,20 +4,28 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
 	_ "modernc.org/sqlite"
 )
+
+var encPrefix = []byte("enc:v1:")
 
 type Event struct {
 	ID          string
@@ -27,6 +35,23 @@ type Event struct {
 	Payload     []byte
 	Status      string
 	CreatedAt   time.Time
+}
+
+type EventFilter struct {
+	ChannelID string
+	Status    string
+	EventType string
+	AfterID   string
+	BeforeID  string
+	Limit     int
+}
+
+type StorageStats struct {
+	PendingEvents int64 `json:"pending_events"`
+	AckedEvents   int64 `json:"acked_events"`
+	TotalEvents   int64 `json:"total_events"`
+	DBSizeBytes   int64 `json:"db_size_bytes"`
+	WALSizeBytes  int64 `json:"wal_size_bytes"`
 }
 
 type writeTask struct {
@@ -39,12 +64,15 @@ type writeTask struct {
 }
 
 type Storage struct {
+	dbPath     string
 	writeDB    *sql.DB
 	readDB     *sql.DB
 	insertStmt *sql.Stmt
 	writeChan  chan *writeTask
 	wg         sync.WaitGroup
 	entropy    io.Reader
+	encMu      sync.RWMutex
+	aead       cipher.AEAD
 }
 
 func New(dbPath string) (*Storage, error) {
@@ -56,9 +84,17 @@ func New(dbPath string) (*Storage, error) {
 	writeDB.SetMaxOpenConns(1)
 
 	s := &Storage{
+		dbPath:    dbPath,
 		writeDB:   writeDB,
 		writeChan: make(chan *writeTask, 1000),
 		entropy:   ulid.Monotonic(rand.Reader, 0),
+	}
+
+	if envKey := os.Getenv("WEBSG_ENCRYPTION_KEY"); envKey != "" {
+		if err := s.SetEncryptionKey(envKey); err != nil {
+			writeDB.Close()
+			return nil, fmt.Errorf("failed to configure encryption key: %w", err)
+		}
 	}
 
 	if err := s.migrate(); err != nil {
@@ -95,6 +131,78 @@ func New(dbPath string) (*Storage, error) {
 	go s.writerLoop()
 
 	return s, nil
+}
+
+func (s *Storage) SetEncryptionKey(key string) error {
+	s.encMu.Lock()
+	defer s.encMu.Unlock()
+
+	if key == "" {
+		s.aead = nil
+		return nil
+	}
+
+	derived := sha256.Sum256([]byte(key))
+	block, err := aes.NewCipher(derived[:])
+	if err != nil {
+		return err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+	s.aead = aead
+	return nil
+}
+
+func (s *Storage) encryptPayload(plain []byte) ([]byte, error) {
+	s.encMu.RLock()
+	aead := s.aead
+	s.encMu.RUnlock()
+
+	if aead == nil {
+		return plain, nil
+	}
+
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+
+	sealed := aead.Seal(nil, nonce, plain, nil)
+	out := make([]byte, 0, len(encPrefix)+len(nonce)+len(sealed))
+	out = append(out, encPrefix...)
+	out = append(out, nonce...)
+	out = append(out, sealed...)
+	return out, nil
+}
+
+func (s *Storage) decryptPayload(stored []byte) ([]byte, error) {
+	if !bytes.HasPrefix(stored, encPrefix) {
+		return stored, nil
+	}
+
+	s.encMu.RLock()
+	aead := s.aead
+	s.encMu.RUnlock()
+
+	if aead == nil {
+		return nil, fmt.Errorf("encrypted payload encountered in database, but WEBSG_ENCRYPTION_KEY is not configured")
+	}
+
+	raw := stored[len(encPrefix):]
+	nonceSize := aead.NonceSize()
+	if len(raw) < nonceSize {
+		return nil, fmt.Errorf("corrupted encrypted payload: shorter than nonce size")
+	}
+
+	nonce := raw[:nonceSize]
+	ciphertext := raw[nonceSize:]
+	plain, err := aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt event payload: %w", err)
+	}
+	return plain, nil
 }
 
 func (s *Storage) migrate() error {
@@ -162,12 +270,17 @@ func (s *Storage) writerLoop() {
 
 		if len(tasks) == 1 {
 			evt := tasks[0].resultEvt
+			dbPayload, encErr := s.encryptPayload(evt.Payload)
+			if encErr != nil {
+				tasks[0].errCh <- encErr
+				continue
+			}
 			_, execErr := s.insertStmt.Exec(
 				evt.ID,
 				evt.ChannelID,
 				evt.EventType,
 				evt.HeadersJSON,
-				evt.Payload,
+				dbPayload,
 				evt.Status,
 			)
 			tasks[0].errCh <- execErr
@@ -186,12 +299,17 @@ func (s *Storage) writerLoop() {
 		var batchErr error
 		for _, t := range tasks {
 			evt := t.resultEvt
+			dbPayload, encErr := s.encryptPayload(evt.Payload)
+			if encErr != nil {
+				batchErr = encErr
+				break
+			}
 			if _, execErr := txStmt.Exec(
 				evt.ID,
 				evt.ChannelID,
 				evt.EventType,
 				evt.HeadersJSON,
-				evt.Payload,
+				dbPayload,
 				evt.Status,
 			); execErr != nil {
 				batchErr = execErr
@@ -273,20 +391,48 @@ func (s *Storage) SyncChannels(records []ChannelRecord) error {
 }
 
 func (s *Storage) ListEvents(ctx context.Context, channelID string, limit int) ([]*Event, error) {
+	return s.ListEventsFiltered(ctx, EventFilter{
+		ChannelID: channelID,
+		Limit:     limit,
+	})
+}
+
+func (s *Storage) ListEventsFiltered(ctx context.Context, filter EventFilter) ([]*Event, error) {
+	limit := filter.Limit
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
 
-	var query string
+	var conds []string
 	var args []any
 
-	if channelID != "" {
-		query = `SELECT id, channel_id, event_type, headers_json, payload, status, created_at FROM events WHERE channel_id = ? ORDER BY id DESC LIMIT ?`
-		args = []any{channelID, limit}
-	} else {
-		query = `SELECT id, channel_id, event_type, headers_json, payload, status, created_at FROM events ORDER BY id DESC LIMIT ?`
-		args = []any{limit}
+	if filter.ChannelID != "" {
+		conds = append(conds, "channel_id = ?")
+		args = append(args, filter.ChannelID)
 	}
+	if filter.Status != "" {
+		conds = append(conds, "status = ?")
+		args = append(args, filter.Status)
+	}
+	if filter.EventType != "" {
+		conds = append(conds, "event_type = ?")
+		args = append(args, filter.EventType)
+	}
+	if filter.AfterID != "" {
+		conds = append(conds, "id > ?")
+		args = append(args, filter.AfterID)
+	}
+	if filter.BeforeID != "" {
+		conds = append(conds, "id < ?")
+		args = append(args, filter.BeforeID)
+	}
+
+	query := "SELECT id, channel_id, event_type, headers_json, payload, status, created_at FROM events"
+	if len(conds) > 0 {
+		query += " WHERE " + strings.Join(conds, " AND ")
+	}
+	query += " ORDER BY id DESC LIMIT ?"
+	args = append(args, limit)
 
 	rows, err := s.readDB.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -294,15 +440,7 @@ func (s *Storage) ListEvents(ctx context.Context, channelID string, limit int) (
 	}
 	defer rows.Close()
 
-	var events []*Event
-	for rows.Next() {
-		var evt Event
-		if err := rows.Scan(&evt.ID, &evt.ChannelID, &evt.EventType, &evt.HeadersJSON, &evt.Payload, &evt.Status, &evt.CreatedAt); err != nil {
-			return nil, err
-		}
-		events = append(events, &evt)
-	}
-	return events, rows.Err()
+	return s.scanEvents(rows)
 }
 
 func (s *Storage) GetEventsAfter(ctx context.Context, channelID string, lastEventID string, limit int) ([]*Event, error) {
@@ -323,12 +461,64 @@ func (s *Storage) GetEventsAfter(ctx context.Context, channelID string, lastEven
 	}
 	defer rows.Close()
 
+	return s.scanEvents(rows)
+}
+
+func (s *Storage) GetPendingEventsAfter(ctx context.Context, channelID string, lastEventID string, limit int) ([]*Event, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	query := `
+		SELECT id, channel_id, event_type, headers_json, payload, status, created_at
+		FROM events
+		WHERE channel_id = ? AND status = 'pending' AND id > ?
+		ORDER BY id ASC
+		LIMIT ?
+	`
+	rows, err := s.readDB.QueryContext(ctx, query, channelID, lastEventID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return s.scanEvents(rows)
+}
+
+func (s *Storage) GetEventByID(ctx context.Context, id string) (*Event, error) {
+	var evt Event
+	err := s.readDB.QueryRowContext(ctx, `
+		SELECT id, channel_id, event_type, headers_json, payload, status, created_at
+		FROM events
+		WHERE id = ?
+	`, id).Scan(&evt.ID, &evt.ChannelID, &evt.EventType, &evt.HeadersJSON, &evt.Payload, &evt.Status, &evt.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	decPayload, err := s.decryptPayload(evt.Payload)
+	if err != nil {
+		return nil, err
+	}
+	evt.Payload = decPayload
+	return &evt, nil
+}
+
+func (s *Storage) scanEvents(rows *sql.Rows) ([]*Event, error) {
 	var events []*Event
 	for rows.Next() {
 		var evt Event
 		if err := rows.Scan(&evt.ID, &evt.ChannelID, &evt.EventType, &evt.HeadersJSON, &evt.Payload, &evt.Status, &evt.CreatedAt); err != nil {
 			return nil, err
 		}
+		decPayload, err := s.decryptPayload(evt.Payload)
+		if err != nil {
+			return nil, err
+		}
+		evt.Payload = decPayload
 		events = append(events, &evt)
 	}
 	return events, rows.Err()
@@ -371,6 +561,68 @@ func (s *Storage) AckEvent(ctx context.Context, id, channelID string) (bool, err
 		return false, err
 	}
 	return rows > 0, nil
+}
+
+func (s *Storage) AckEventsBatch(ctx context.Context, ids []string, channelID string) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+
+	query := fmt.Sprintf("UPDATE events SET status = 'acked', acked_at = CURRENT_TIMESTAMP WHERE id IN (%s)", strings.Join(placeholders, ","))
+	if channelID != "" {
+		query += " AND channel_id = ?"
+		args = append(args, channelID)
+	}
+
+	res, err := s.writeDB.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *Storage) GetStats(ctx context.Context) (*StorageStats, error) {
+	stats := &StorageStats{}
+
+	rows, err := s.readDB.QueryContext(ctx, "SELECT status, COUNT(*) FROM events GROUP BY status")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, err
+		}
+		switch status {
+		case "pending":
+			stats.PendingEvents = count
+		case "acked":
+			stats.AckedEvents = count
+		}
+		stats.TotalEvents += count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if fi, err := os.Stat(s.dbPath); err == nil {
+		stats.DBSizeBytes = fi.Size()
+	}
+	if fi, err := os.Stat(s.dbPath + "-wal"); err == nil {
+		stats.WALSizeBytes = fi.Size()
+	}
+
+	return stats, nil
 }
 
 func (s *Storage) PruneEvents(ctx context.Context, ackedCutoff, unackedCutoff time.Time) (int64, error) {

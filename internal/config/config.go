@@ -123,6 +123,8 @@ type Config struct {
 	ModulesDir           string
 	AdminToken           string
 	IsDefaultAdminToken  bool
+	EncryptionKey        string
+	AllowPrivateNet      bool
 	HousekeepingInterval time.Duration
 	AckedRetention       time.Duration
 	UnackedRetention     time.Duration
@@ -157,6 +159,10 @@ func Load() *Config {
 		isDefaultAdmin = true
 	}
 
+	encryptionKey := os.Getenv("WEBSG_ENCRYPTION_KEY")
+	allowPrivateEnv := strings.ToLower(strings.TrimSpace(os.Getenv("WEBSG_ALLOW_PRIVATE_NET")))
+	allowPrivateNet := allowPrivateEnv == "true" || allowPrivateEnv == "1"
+
 	cfg := &Config{
 		Port:                 port,
 		DatabasePath:         dbPath,
@@ -164,6 +170,8 @@ func Load() *Config {
 		ModulesDir:           modulesDir,
 		AdminToken:           adminToken,
 		IsDefaultAdminToken:  isDefaultAdmin,
+		EncryptionKey:        encryptionKey,
+		AllowPrivateNet:      allowPrivateNet,
 		HousekeepingInterval: 1 * time.Hour,
 		AckedRetention:       24 * time.Hour,
 		UnackedRetention:     7 * 24 * time.Hour,

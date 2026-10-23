@@ -591,7 +591,7 @@ func TestStream_ReplayPaginatesOver100Events(t *testing.T) {
 	eventIDs := make([]string, totalEvents)
 	for i := 0; i < totalEvents; i++ {
 		rec := httptest.NewRecorder()
-		srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open", bytes.NewReader([]byte(fmt.Sprintf(`{"idx":%d}`, i)))))
+		srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open", bytes.NewReader(fmt.Appendf(nil, `{"idx":%d}`, i))))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("ingest failed on event %d: %s", i, rec.Body.String())
 		}
@@ -955,5 +955,234 @@ func TestIngestAndStream_CredentialSegregation(t *testing.T) {
 	srv.Routes().ServeHTTP(rec6, req6)
 	if rec6.Code != http.StatusUnauthorized {
 		t.Fatalf("expected Ack with IngestToken to be 401 Unauthorized, got %d", rec6.Code)
+	}
+}
+
+func TestAckBatch_And_PendingReplayStream(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Ingest 3 events into test_secure
+	ids := make([]string, 3)
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/ingest/test_secure?token=secret_token_abc", bytes.NewReader(fmt.Appendf(nil, `{"n":%d}`, i+1)))
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("ingest %d failed: %d", i, rec.Code)
+		}
+		ids[i] = rec.Header().Get("X-Event-ID")
+	}
+
+	// 1. Batch ACK without auth -> 401
+	batchBody, _ := json.Marshal(map[string]any{
+		"channel": "test_secure",
+		"ids":     []string{ids[0], ids[1]},
+	})
+	unauthBatch := httptest.NewRequest(http.MethodPost, "/v1/events/ack-batch", bytes.NewReader(batchBody))
+	unauthRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(unauthRec, unauthBatch)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated ack-batch, got %d", unauthRec.Code)
+	}
+
+	// 2. Batch ACK with valid stream token -> 200 OK (acks ids[0] and ids[1])
+	authBatch := httptest.NewRequest(http.MethodPost, "/v1/events/ack-batch", bytes.NewReader(batchBody))
+	authBatch.Header.Set("Authorization", "Bearer secret_token_abc")
+	authRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(authRec, authBatch)
+	if authRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for authenticated ack-batch, got %d: %s", authRec.Code, authRec.Body.String())
+	}
+	if !strings.Contains(authRec.Body.String(), `"acked_count":2`) {
+		t.Errorf("expected acked_count=2, got %s", authRec.Body.String())
+	}
+
+	// 3. Connect to stream with ?replay=pending (without Last-Event-ID) -> must only deliver ids[2]
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/stream?channel=test_secure&replay=pending", nil).WithContext(ctx)
+	streamReq.Header.Set("Authorization", "Bearer secret_token_abc")
+	streamRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(streamRec, streamReq)
+
+	output := streamRec.Body.String()
+	if strings.Contains(output, ids[0]) || strings.Contains(output, ids[1]) {
+		t.Errorf("expected acked events (%s, %s) to NOT be replayed in replay=pending mode, got:\n%s", ids[0], ids[1], output)
+	}
+	if !strings.Contains(output, ids[2]) {
+		t.Errorf("expected pending event %s to be replayed in replay=pending mode, got:\n%s", ids[2], output)
+	}
+}
+
+func TestIngest_MiddlewarePayloadAndEventTypeMutation(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptContent := `
+function handle(req, env) {
+    var data = JSON.parse(req.body);
+    return {
+        accept: true,
+        body: JSON.stringify({ mutated: true, original_id: data.id }),
+        event_type: "invoice.mutated"
+    };
+}
+`
+	scriptPath := filepath.Join(tmpDir, "mutate_ingest.js")
+	_ = os.WriteFile(scriptPath, []byte(scriptContent), 0644)
+
+	dbPath := filepath.Join(tmpDir, "test_mutate.db")
+	store, _ := storage.New(dbPath)
+	defer store.Close()
+
+	cfg := &config.Config{
+		Port:       "8080",
+		AdminToken: "admin_token",
+		Channels: map[string]*config.ChannelConfig{
+			"chan_mutate": {
+				ID:   "chan_mutate",
+				Name: "Mutate Channel",
+				HTTP: config.HTTPConfig{
+					AllowedMethods: []string{"POST"},
+					SuccessStatus:  200,
+				},
+				Auth: config.AuthConfig{Type: "none"},
+				Middleware: config.MiddlewareConfig{
+					Enabled: true,
+					Script:  scriptPath,
+				},
+			},
+		},
+	}
+
+	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
+
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/ingest/chan_mutate?event_type=original.type", bytes.NewReader([]byte(`{"id":42}`))))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	evtID := rec.Header().Get("X-Event-ID")
+	evt, err := store.GetEventByID(context.Background(), evtID)
+	if err != nil || evt == nil {
+		t.Fatalf("failed to fetch stored event: %v", err)
+	}
+	if evt.EventType != "invoice.mutated" {
+		t.Errorf("expected mutated event_type 'invoice.mutated', got %q", evt.EventType)
+	}
+	if string(evt.Payload) != `{"mutated":true,"original_id":42}` {
+		t.Errorf("expected mutated payload, got %s", evt.Payload)
+	}
+}
+
+func TestAdminReload_HotReloadChannels(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_reload.db")
+	store, _ := storage.New(dbPath)
+	defer store.Close()
+
+	cfg := &config.Config{
+		Port:        "8080",
+		ChannelsDir: tmpDir,
+		AdminToken:  "admin_secret",
+		Channels:    make(map[string]*config.ChannelConfig),
+	}
+
+	srv := NewServer(cfg, store, engine.New(tmpDir), sse.New())
+
+	// Write a new channel YAML file dynamically
+	yamlContent := `
+id: hot_chan
+name: "Hot Reloaded Channel"
+http:
+  allowed_methods: ["POST"]
+  success_status: 201
+auth:
+  type: "none"
+`
+	_ = os.WriteFile(filepath.Join(tmpDir, "hot_chan.yaml"), []byte(yamlContent), 0644)
+
+	// Trigger POST /v1/admin/reload
+	reloadReq := httptest.NewRequest(http.MethodPost, "/v1/admin/reload", nil)
+	reloadReq.Header.Set("X-Admin-Token", "admin_secret")
+	reloadRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(reloadRec, reloadReq)
+
+	if reloadRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from reload, got %d: %s", reloadRec.Code, reloadRec.Body.String())
+	}
+
+	// Verify we can immediately ingest into hot_chan (proving both config reload and SQLite FK sync)
+	ingestReq := httptest.NewRequest(http.MethodPost, "/v1/ingest/hot_chan", bytes.NewReader([]byte(`{"hot":true}`)))
+	ingestRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ingestRec, ingestReq)
+	if ingestRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on hot-reloaded channel, got %d: %s", ingestRec.Code, ingestRec.Body.String())
+	}
+}
+
+func TestManualReplay_Stats_And_EventFilters(t *testing.T) {
+	srv, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Ingest 2 events with different event types
+	rec1 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec1, httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=pix.paid", bytes.NewReader([]byte(`{"tx":100}`))))
+	evt1ID := rec1.Header().Get("X-Event-ID")
+
+	rec2 := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/v1/ingest/test_open?event_type=boleto.issued", bytes.NewReader([]byte(`{"tx":200}`))))
+	evt2ID := rec2.Header().Get("X-Event-ID")
+
+	// Ack evt1
+	ackRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(ackRec, httptest.NewRequest(http.MethodPost, "/v1/events/"+evt1ID+"/ack", nil))
+
+	// 1. Test GET /v1/events with filters (?status=pending&event_type=boleto.issued)
+	listReq := httptest.NewRequest(http.MethodGet, "/v1/events?channel=test_open&status=pending&event_type=boleto.issued", nil)
+	listReq.Header.Set("X-Admin-Token", "test_admin_token")
+	listRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from filtered /v1/events, got %d", listRec.Code)
+	}
+	var events []*storage.Event
+	_ = json.Unmarshal(listRec.Body.Bytes(), &events)
+	if len(events) != 1 || events[0].ID != evt2ID {
+		t.Fatalf("expected only evt2 (%s) from filtered events, got %+v", evt2ID, events)
+	}
+
+	// 2. Test Manual Replay (POST /v1/events/{id}/replay) while subscriber is listening
+	subCh := srv.sse.Subscribe("test_open")
+	defer srv.sse.Unsubscribe("test_open", subCh)
+
+	replayReq := httptest.NewRequest(http.MethodPost, "/v1/events/"+evt1ID+"/replay", nil)
+	replayReq.Header.Set("X-Admin-Token", "test_admin_token")
+	replayRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(replayRec, replayReq)
+	if replayRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from manual replay, got %d: %s", replayRec.Code, replayRec.Body.String())
+	}
+
+	select {
+	case replayed := <-subCh:
+		if replayed.ID != evt1ID {
+			t.Errorf("expected replayed event ID %s, got %s", evt1ID, replayed.ID)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for manually replayed event on SSE subscriber")
+	}
+
+	// 3. Test GET /v1/stats
+	statsReq := httptest.NewRequest(http.MethodGet, "/v1/stats", nil)
+	statsReq.Header.Set("X-Admin-Token", "test_admin_token")
+	statsRec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(statsRec, statsReq)
+	if statsRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/stats, got %d", statsRec.Code)
+	}
+	if !strings.Contains(statsRec.Body.String(), `"pending_events":1`) || !strings.Contains(statsRec.Body.String(), `"acked_events":1`) {
+		t.Errorf("expected stats to report 1 pending and 1 acked event, got: %s", statsRec.Body.String())
 	}
 }

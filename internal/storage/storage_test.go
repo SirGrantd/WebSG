@@ -4,9 +4,11 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -444,4 +446,123 @@ func TestStorage_ConcurrentReadWrite(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestStorage_EncryptionAtRest_AES256GCM(t *testing.T) {
+	dbPath := "test_encryption.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-wal")
+	defer os.Remove(dbPath + "-shm")
+
+	t.Setenv("WEBSG_ENCRYPTION_KEY", "master-secret-key-for-aes-256-gcm")
+
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to initialize storage: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	_ = s.SyncChannels([]ChannelRecord{{ID: "chan_enc", Name: "Encrypted Channel"}})
+
+	secretPayload := []byte(`{"cpf":"123.456.789-00","valor":9500.50}`)
+	evt, err := s.InsertEvent(ctx, "chan_enc", "pix.received", `{}`, secretPayload)
+	if err != nil {
+		t.Fatalf("failed to insert encrypted event: %v", err)
+	}
+
+	// 1. In-memory returned event must remain plaintext for immediate SSE broadcast
+	if !bytes.Equal(evt.Payload, secretPayload) {
+		t.Fatalf("expected in-memory event payload to be plaintext, got %s", evt.Payload)
+	}
+
+	// 2. Inspect raw SQLite column directly to verify ciphertext on disk
+	var rawOnDisk []byte
+	if err := s.readDB.QueryRowContext(ctx, "SELECT payload FROM events WHERE id = ?", evt.ID).Scan(&rawOnDisk); err != nil {
+		t.Fatalf("failed to query raw payload from sqlite: %v", err)
+	}
+	if !strings.HasPrefix(string(rawOnDisk), "enc:v1:") {
+		t.Fatalf("expected raw payload on disk to have 'enc:v1:' prefix, got: %s", rawOnDisk)
+	}
+	if bytes.Contains(rawOnDisk, []byte("123.456.789-00")) {
+		t.Fatalf("security failure: sensitive plaintext CPF found in raw SQLite storage!")
+	}
+
+	// 3. Reading through Storage API (GetEventByID & ListEvents) must transparently decrypt
+	fetched, err := s.GetEventByID(ctx, evt.ID)
+	if err != nil {
+		t.Fatalf("GetEventByID failed: %v", err)
+	}
+	if !bytes.Equal(fetched.Payload, secretPayload) {
+		t.Errorf("expected decrypted payload %s, got %s", secretPayload, fetched.Payload)
+	}
+
+	// 4. Clearing encryption key must fail decryption instead of leaking garbage
+	_ = s.SetEncryptionKey("")
+	if _, err := s.GetEventByID(ctx, evt.ID); err == nil {
+		t.Errorf("expected error when reading encrypted payload without key, got nil")
+	}
+}
+
+func TestStorage_BatchAck_PendingReplay_Filters_And_Stats(t *testing.T) {
+	dbPath := "test_advanced_ops.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-wal")
+	defer os.Remove(dbPath + "-shm")
+
+	s, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to initialize storage: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	_ = s.SyncChannels([]ChannelRecord{{ID: "chan_ops", Name: "Ops Channel"}})
+
+	evt1, _ := s.InsertEvent(ctx, "chan_ops", "nfe.authorized", `{}`, []byte(`{"n":1}`))
+	evt2, _ := s.InsertEvent(ctx, "chan_ops", "nfe.canceled", `{}`, []byte(`{"n":2}`))
+	evt3, _ := s.InsertEvent(ctx, "chan_ops", "nfe.authorized", `{}`, []byte(`{"n":3}`))
+
+	// Batch ACK evt1 and evt2
+	ackedCount, err := s.AckEventsBatch(ctx, []string{evt1.ID, evt2.ID}, "chan_ops")
+	if err != nil {
+		t.Fatalf("AckEventsBatch failed: %v", err)
+	}
+	if ackedCount != 2 {
+		t.Fatalf("expected 2 acked events, got %d", ackedCount)
+	}
+
+	// Pending replay must only return evt3
+	pending, err := s.GetPendingEventsAfter(ctx, "chan_ops", "", 100)
+	if err != nil {
+		t.Fatalf("GetPendingEventsAfter failed: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != evt3.ID {
+		t.Fatalf("expected only evt3 (%s) in pending replay, got %+v", evt3.ID, pending)
+	}
+
+	// Filtered list by status=acked and event_type=nfe.authorized -> only evt1
+	filtered, err := s.ListEventsFiltered(ctx, EventFilter{
+		ChannelID: "chan_ops",
+		Status:    "acked",
+		EventType: "nfe.authorized",
+	})
+	if err != nil {
+		t.Fatalf("ListEventsFiltered failed: %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].ID != evt1.ID {
+		t.Fatalf("expected only evt1 in filtered query, got %+v", filtered)
+	}
+
+	// Verify Stats
+	stats, err := s.GetStats(ctx)
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if stats.PendingEvents != 1 || stats.AckedEvents != 2 || stats.TotalEvents != 3 {
+		t.Errorf("unexpected event stats: %+v", stats)
+	}
+	if stats.DBSizeBytes <= 0 {
+		t.Errorf("expected DBSizeBytes > 0, got %d", stats.DBSizeBytes)
+	}
 }
